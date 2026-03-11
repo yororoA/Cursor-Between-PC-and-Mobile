@@ -17,6 +17,7 @@ const api = {
   projectionStop: (sessionId: string) => ipcRenderer.invoke('lan:projection-stop', sessionId),
   projectionStatus: (sessionId: string) => ipcRenderer.invoke('lan:projection-status', sessionId),
   setOverlayMode: (enabled: boolean) => ipcRenderer.invoke('ui:set-overlay-mode', enabled),
+  setClickThrough: (enabled: boolean) => ipcRenderer.invoke('ui:set-click-through', enabled),
   onDevicesUpdated: (callback: (devices: unknown[]) => void) => {
     const listener = (_event: unknown, devices: unknown[]): void => callback(devices)
     ipcRenderer.on('lan:devices-updated', listener)

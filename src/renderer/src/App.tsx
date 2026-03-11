@@ -337,17 +337,28 @@ function App(): React.JSX.Element {
     if (!compare) {
       document.body.classList.remove('overlay-mode')
       void window.api.setOverlayMode(false)
+      void window.api.setClickThrough(false)
       return
     }
 
     document.body.classList.add('overlay-mode')
     void window.api.setOverlayMode(true)
+    void window.api.setClickThrough(false)
 
     return () => {
       document.body.classList.remove('overlay-mode')
       void window.api.setOverlayMode(false)
+      void window.api.setClickThrough(false)
     }
   }, [compare])
+
+  useEffect(() => {
+    const passthrough = Boolean(compare && connectionSnapshot)
+    void window.api.setClickThrough(passthrough)
+    return () => {
+      void window.api.setClickThrough(false)
+    }
+  }, [compare, connectionSnapshot])
 
   useEffect(() => {
     return () => {
@@ -371,7 +382,8 @@ function App(): React.JSX.Element {
     try {
       const stream = await navigator.mediaDevices.getDisplayMedia({
         video: {
-          frameRate: { ideal: 12, max: 15 }
+          frameRate: { ideal: 12, max: 15 },
+          displaySurface: 'monitor'
         },
         audio: false
       })

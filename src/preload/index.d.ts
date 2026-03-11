@@ -92,10 +92,14 @@ type AppApi = {
   getPairingInfo: () => Promise<PairingInfo>
   adbConnect: (target: string) => Promise<AdbConnectResult>
   projectionStart: (targetDeviceId: string) => Promise<ProjectionStartResult>
-  projectionPush: (sessionId: string, payload: ProjectionPushPayload) => Promise<ProjectionPushResult>
+  projectionPush: (
+    sessionId: string,
+    payload: ProjectionPushPayload
+  ) => Promise<ProjectionPushResult>
   projectionStop: (sessionId: string) => Promise<boolean>
   projectionStatus: (sessionId: string) => Promise<ProjectionStatus | null>
   setOverlayMode: (enabled: boolean) => Promise<boolean>
+  setClickThrough: (enabled: boolean) => Promise<boolean>
   onDevicesUpdated: (callback: (devices: DeviceInfo[]) => void) => () => void
   onProjectionStatus: (callback: (payload: ProjectionStatus) => void) => () => void
 }

@@ -919,15 +919,39 @@ function parseDpi(raw: string): number {
   return Number(match[1] || 420)
 }
 
+function parseXdpiYdpi(raw: string): number {
+  const fullMatch = raw.match(/xDpi\s*[=:]\s*([\d.]+)[\s\S]*?yDpi\s*[=:]\s*([\d.]+)/i)
+  if (fullMatch) {
+    const x = Number(fullMatch[1])
+    const y = Number(fullMatch[2])
+    if (Number.isFinite(x) && Number.isFinite(y) && x > 0 && y > 0) {
+      return Math.round((x + y) / 2)
+    }
+  }
+
+  const xOnly = raw.match(/xDpi\s*[=:]\s*([\d.]+)/i)
+  const yOnly = raw.match(/yDpi\s*[=:]\s*([\d.]+)/i)
+  const x = xOnly ? Number(xOnly[1]) : NaN
+  const y = yOnly ? Number(yOnly[1]) : NaN
+  if (Number.isFinite(x) && x > 0 && Number.isFinite(y) && y > 0) {
+    return Math.round((x + y) / 2)
+  }
+  if (Number.isFinite(x) && x > 0) return Math.round(x)
+  if (Number.isFinite(y) && y > 0) return Math.round(y)
+
+  return 0
+}
+
 async function readAdbDevice(adb: string, serial: string): Promise<DeviceRecord> {
-  const [model, size, density] = await Promise.all([
+  const [model, size, displayDump, density] = await Promise.all([
     execPromise(`"${adb}" -s "${serial}" shell getprop ro.product.model`),
     execPromise(`"${adb}" -s "${serial}" shell wm size`),
+    execPromise(`"${adb}" -s "${serial}" shell dumpsys display`),
     execPromise(`"${adb}" -s "${serial}" shell wm density`)
   ])
 
   const resolution = parseResolution(size.stdout)
-  const dpi = parseDpi(density.stdout)
+  const dpi = parseXdpiYdpi(displayDump.stdout) || parseDpi(density.stdout)
 
   return {
     id: serial,
@@ -1228,6 +1252,10 @@ function createWindow(): void {
   const mainWindow = new BrowserWindow({
     width: 900,
     height: 670,
+    fullscreen: true,
+    frame: false,
+    transparent: true,
+    backgroundColor: '#00000000',
     show: false,
     autoHideMenuBar: true,
     ...(process.platform === 'linux' ? { icon } : {}),
@@ -1239,6 +1267,7 @@ function createWindow(): void {
 
   mainWindowRef = mainWindow
   mainWindow.on('ready-to-show', () => {
+    mainWindow.setFullScreen(true)
     mainWindow.show()
   })
   mainWindow.webContents.setWindowOpenHandler((details) => {
@@ -1263,12 +1292,16 @@ app.whenReady().then(() => {
           types: ['screen'],
           thumbnailSize: { width: 0, height: 0 }
         })
-        const primary = sources[0]
-        if (!primary) {
+        const primaryDisplayId = String(screen.getPrimaryDisplay().id)
+        const preferredSource =
+          sources.find((source) => source.display_id === primaryDisplayId) ||
+          sources.find((source) => Boolean(source.display_id)) ||
+          sources[0]
+        if (!preferredSource) {
           callback({})
           return
         }
-        callback({ video: primary })
+        callback({ video: preferredSource })
       } catch {
         callback({})
       }
@@ -1353,6 +1386,14 @@ app.whenReady().then(() => {
     mainWindowRef.setVisibleOnAllWorkspaces(Boolean(enabled), {
       visibleOnFullScreen: true
     })
+    return true
+  })
+
+  ipcMain.handle('ui:set-click-through', (_event, enabled: boolean) => {
+    if (!mainWindowRef || mainWindowRef.isDestroyed()) return false
+    mainWindowRef.setIgnoreMouseEvents(Boolean(enabled), { forward: true })
+    mainWindowRef.setFocusable(!enabled)
+    if (enabled) mainWindowRef.blur()
     return true
   })
 

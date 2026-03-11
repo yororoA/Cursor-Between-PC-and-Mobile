@@ -5,10 +5,7 @@ body {
   min-height: 100vh;
   overflow-x: hidden;
   overflow-y: auto;
-  background:
-    radial-gradient(circle at 15% 20%, #f9d37e 0%, rgba(249, 211, 126, 0) 32%),
-    radial-gradient(circle at 82% 78%, #8ec9ff 0%, rgba(142, 201, 255, 0) 38%),
-    linear-gradient(145deg, #0f1a24 0%, #1b2735 50%, #132436 100%);
+  background: transparent;
   user-select: none;
 }
 
