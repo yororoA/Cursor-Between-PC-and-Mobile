@@ -325,6 +325,13 @@ async function capturePrimaryDisplayFrameViaWindowsApi(): Promise<{
 } | null> {
   if (process.platform !== 'win32') return null
 
+  const display = screen.getPrimaryDisplay()
+  const scaleFactor = display.scaleFactor > 0 ? display.scaleFactor : 1
+  const captureX = Math.round(display.bounds.x * scaleFactor)
+  const captureY = Math.round(display.bounds.y * scaleFactor)
+  const captureWidth = Math.max(1, Math.round(display.size.width * scaleFactor))
+  const captureHeight = Math.max(1, Math.round(display.size.height * scaleFactor))
+
   const tempPath = join(
     os.tmpdir(),
     `cursor-bridge-capture-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}.png`
@@ -332,20 +339,24 @@ async function capturePrimaryDisplayFrameViaWindowsApi(): Promise<{
 
   const escapedTempPath = tempPath.replace(/'/g, "''")
   const psScript = [
-    'Add-Type -TypeDefinition \'using System; using System.Runtime.InteropServices; public static class NativeCursor { [StructLayout(LayoutKind.Sequential)] public struct POINT { public int X; public int Y; } [StructLayout(LayoutKind.Sequential)] public struct CURSORINFO { public int cbSize; public int flags; public IntPtr hCursor; public POINT ptScreenPos; } public const int CURSOR_SHOWING = 0x00000001; public const uint DI_NORMAL = 0x0003; [DllImport("user32.dll")] public static extern bool GetCursorInfo(ref CURSORINFO pci); [DllImport("user32.dll")] public static extern bool DrawIconEx(IntPtr hdc, int xLeft, int yTop, IntPtr hIcon, int cxWidth, int cyWidth, int istepIfAniCur, IntPtr hbrFlickerFreeDraw, uint diFlags); }\'',
+    'Add-Type -TypeDefinition \'using System; using System.Runtime.InteropServices; public static class NativeCursor { [StructLayout(LayoutKind.Sequential)] public struct POINT { public int X; public int Y; } [StructLayout(LayoutKind.Sequential)] public struct CURSORINFO { public int cbSize; public int flags; public IntPtr hCursor; public POINT ptScreenPos; } [StructLayout(LayoutKind.Sequential)] public struct ICONINFO { public bool fIcon; public int xHotspot; public int yHotspot; public IntPtr hbmMask; public IntPtr hbmColor; } public const int CURSOR_SHOWING = 0x00000001; public const uint DI_NORMAL = 0x0003; [DllImport("user32.dll")] public static extern bool SetProcessDPIAware(); [DllImport("user32.dll")] public static extern bool GetCursorInfo(ref CURSORINFO pci); [DllImport("user32.dll")] public static extern bool DrawIconEx(IntPtr hdc, int xLeft, int yTop, IntPtr hIcon, int cxWidth, int cyWidth, int istepIfAniCur, IntPtr hbrFlickerFreeDraw, uint diFlags); [DllImport("user32.dll")] public static extern bool GetIconInfo(IntPtr hIcon, out ICONINFO piconinfo); [DllImport("gdi32.dll")] public static extern bool DeleteObject(IntPtr hObject); }\'',
     'Add-Type -AssemblyName System.Windows.Forms',
     'Add-Type -AssemblyName System.Drawing',
-    '$bounds = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds',
-    '$bmp = New-Object System.Drawing.Bitmap $bounds.Width, $bounds.Height',
+    '[NativeCursor]::SetProcessDPIAware() | Out-Null',
+    `$captureX = ${captureX}`,
+    `$captureY = ${captureY}`,
+    `$captureW = ${captureWidth}`,
+    `$captureH = ${captureHeight}`,
+    '$bmp = New-Object System.Drawing.Bitmap $captureW, $captureH',
     '$g = [System.Drawing.Graphics]::FromImage($bmp)',
-    '$g.CopyFromScreen($bounds.Location, [System.Drawing.Point]::Empty, $bounds.Size)',
+    '$g.CopyFromScreen($captureX, $captureY, 0, 0, (New-Object System.Drawing.Size $captureW, $captureH))',
     '$ci = New-Object NativeCursor+CURSORINFO',
     "$ci.cbSize = [System.Runtime.InteropServices.Marshal]::SizeOf([type]'NativeCursor+CURSORINFO')",
-    'if ([NativeCursor]::GetCursorInfo([ref]$ci) -and (($ci.flags -band [NativeCursor]::CURSOR_SHOWING) -ne 0)) { $cx = $ci.ptScreenPos.X - $bounds.X; $cy = $ci.ptScreenPos.Y - $bounds.Y; if ($cx -ge 0 -and $cy -ge 0 -and $cx -lt $bounds.Width -and $cy -lt $bounds.Height) { $hdc = $g.GetHdc(); [NativeCursor]::DrawIconEx($hdc, $cx, $cy, $ci.hCursor, 0, 0, 0, [IntPtr]::Zero, [NativeCursor]::DI_NORMAL) | Out-Null; $g.ReleaseHdc($hdc) } }',
+    '$icon = New-Object NativeCursor+ICONINFO',
+    'if ([NativeCursor]::GetCursorInfo([ref]$ci) -and (($ci.flags -band [NativeCursor]::CURSOR_SHOWING) -ne 0)) { $cursorX = $ci.ptScreenPos.X - $captureX; $cursorY = $ci.ptScreenPos.Y - $captureY; if ([NativeCursor]::GetIconInfo($ci.hCursor, [ref]$icon)) { $drawX = $cursorX - $icon.xHotspot; $drawY = $cursorY - $icon.yHotspot; if ($drawX -lt $captureW -and $drawY -lt $captureH -and ($drawX + 64) -gt 0 -and ($drawY + 64) -gt 0) { $hdc = $g.GetHdc(); [NativeCursor]::DrawIconEx($hdc, $drawX, $drawY, $ci.hCursor, 0, 0, 0, [IntPtr]::Zero, [NativeCursor]::DI_NORMAL) | Out-Null; $g.ReleaseHdc($hdc) } if ($icon.hbmMask -ne [IntPtr]::Zero) { [NativeCursor]::DeleteObject($icon.hbmMask) | Out-Null } if ($icon.hbmColor -ne [IntPtr]::Zero) { [NativeCursor]::DeleteObject($icon.hbmColor) | Out-Null } } }',
     `$bmp.Save('${escapedTempPath}', [System.Drawing.Imaging.ImageFormat]::Png)`,
     '$g.Dispose()',
-    '$bmp.Dispose()',
-    'Write-Output ("{0},{1}" -f $bounds.Width, $bounds.Height)'
+    '$bmp.Dispose()'
   ].join('; ')
 
   const command = `powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command "${psScript.replace(/"/g, '\\"')}"`
@@ -362,10 +373,8 @@ async function capturePrimaryDisplayFrameViaWindowsApi(): Promise<{
       }
     }
 
-    const output = `${result.stdout}`.trim()
-    const [wRaw, hRaw] = output.split(',')
-    const width = Math.max(1, Number(wRaw) || 0)
-    const height = Math.max(1, Number(hRaw) || 0)
+    const width = captureWidth
+    const height = captureHeight
     const imageDataUrl = `data:image/png;base64,${readFileSync(tempPath).toString('base64')}`
 
     return {

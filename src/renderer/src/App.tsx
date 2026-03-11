@@ -155,7 +155,12 @@ function buildCompareLayout(local: DeviceInfo, remote: DeviceInfo): CompareLayou
   }
 }
 
-function snapAxis(remoteCenter: number, remoteHalf: number, localHalf: number, threshold: number): { snapped: number; guide: number | null } {
+function snapAxis(
+  remoteCenter: number,
+  remoteHalf: number,
+  localHalf: number,
+  threshold: number
+): { snapped: number; guide: number | null } {
   const remoteRefs = [
     { pos: remoteCenter - remoteHalf, centerDelta: remoteHalf },
     { pos: remoteCenter, centerDelta: 0 },
@@ -185,7 +190,12 @@ function snapAxis(remoteCenter: number, remoteHalf: number, localHalf: number, t
   }
 }
 
-function rectFromCenter(centerX: number, centerY: number, width: number, height: number): RectByCenter {
+function rectFromCenter(
+  centerX: number,
+  centerY: number,
+  width: number,
+  height: number
+): RectByCenter {
   const halfW = width / 2
   const halfH = height / 2
   return {
@@ -257,12 +267,21 @@ function App(): React.JSX.Element {
   const [projectionStatus, setProjectionStatus] = useState<ProjectionStatus | null>(null)
   const [projectionStatusText, setProjectionStatusText] = useState('未建立投映会话')
   const [sendPreviewDataUrl, setSendPreviewDataUrl] = useState('')
-  const [snapGuides, setSnapGuides] = useState<{ x: number | null; y: number | null }>({ x: null, y: null })
+  const [snapGuides, setSnapGuides] = useState<{ x: number | null; y: number | null }>({
+    x: null,
+    y: null
+  })
   const [stageSize, setStageSize] = useState({ width: 900, height: 540 })
   const [screenCaptureReady, setScreenCaptureReady] = useState(false)
   const lastPreviewUpdateAtRef = useRef(0)
   const stageRef = useRef<HTMLElement | null>(null)
-  const dragStateRef = useRef<{ active: boolean; startX: number; startY: number; x: number; y: number }>({
+  const dragStateRef = useRef<{
+    active: boolean
+    startX: number
+    startY: number
+    x: number
+    y: number
+  }>({
     active: false,
     startX: 0,
     startY: 0,
@@ -782,16 +801,17 @@ function App(): React.JSX.Element {
     const sourceRect = localBounds
     const projectionEnabled = Boolean(connectionSnapshot && overlapRect)
     const overlapAreaPx = overlapRect ? Math.round(overlapRect.width * overlapRect.height) : 0
-    const projectionStyle = projectionEnabled && overlapRect
-      ? {
-          left: `calc(50% + ${overlapRect.left}px)`,
-          top: `calc(50% + ${overlapRect.top}px)`,
-          width: `${overlapRect.width}px`,
-          height: `${overlapRect.height}px`,
-          backgroundSize: `${sourceRect.width}px ${sourceRect.height}px`,
-          backgroundPosition: `${-(overlapRect.left - sourceRect.left)}px ${-(overlapRect.top - sourceRect.top)}px`
-        }
-      : null
+    const projectionStyle =
+      projectionEnabled && overlapRect
+        ? {
+            left: `calc(50% + ${overlapRect.left}px)`,
+            top: `calc(50% + ${overlapRect.top}px)`,
+            width: `${overlapRect.width}px`,
+            height: `${overlapRect.height}px`,
+            backgroundSize: `${sourceRect.width}px ${sourceRect.height}px`,
+            backgroundPosition: `${-(overlapRect.left - sourceRect.left)}px ${-(overlapRect.top - sourceRect.top)}px`
+          }
+        : null
     const rulerExtentX = Math.floor(stageSize.width / (2 * compareLayout.pxPerMm))
     const rulerExtentY = Math.floor(stageSize.height / (2 * compareLayout.pxPerMm))
     const rulerStepMm = 10
@@ -812,7 +832,11 @@ function App(): React.JSX.Element {
             返回设备列表
           </button>
           <div className="compare-actions">
-            <button className="refresh-btn" type="button" onClick={() => void handleConfirmConnection(overlapAreaPx)}>
+            <button
+              className="refresh-btn"
+              type="button"
+              onClick={() => void handleConfirmConnection(overlapAreaPx)}
+            >
               确认连接
             </button>
             <p className="hint">拖拽右侧设备图进行位置微调</p>
@@ -821,13 +845,15 @@ function App(): React.JSX.Element {
 
         {connectionSnapshot ? (
           <p className="snapshot-line">
-            快照时间: {toTimeLabel(connectionSnapshot.confirmedAt)} | 远端偏移: ({Math.round(connectionSnapshot.remoteOffset.x)},{' '}
+            快照时间: {toTimeLabel(connectionSnapshot.confirmedAt)} | 远端偏移: (
+            {Math.round(connectionSnapshot.remoteOffset.x)},{' '}
             {Math.round(connectionSnapshot.remoteOffset.y)}) | 重叠面积: {overlapAreaPx}px^2
           </p>
         ) : null}
 
         <p className="snapshot-line">
-          投映状态: {projectionStatusText} | 通道: {projectionStatus?.streamOnline ? '在线' : '离线'} | ACK: #
+          投映状态: {projectionStatusText} | 通道:{' '}
+          {projectionStatus?.streamOnline ? '在线' : '离线'} | ACK: #
           {projectionStatus?.lastAckFrameId ?? 0}
         </p>
 
@@ -850,7 +876,11 @@ function App(): React.JSX.Element {
               const px = mm * compareLayout.pxPerMm
               const major = mm % 50 === 0
               return (
-                <div key={`rx-${mm}`} className={`ruler-tick x ${major ? 'major' : ''}`} style={{ left: `calc(50% + ${px}px)` }}>
+                <div
+                  key={`rx-${mm}`}
+                  className={`ruler-tick x ${major ? 'major' : ''}`}
+                  style={{ left: `calc(50% + ${px}px)` }}
+                >
                   {major ? <span>{mm}mm</span> : null}
                 </div>
               )
@@ -862,15 +892,26 @@ function App(): React.JSX.Element {
               const px = mm * compareLayout.pxPerMm
               const major = mm % 50 === 0
               return (
-                <div key={`ry-${mm}`} className={`ruler-tick y ${major ? 'major' : ''}`} style={{ top: `calc(50% + ${px}px)` }}>
+                <div
+                  key={`ry-${mm}`}
+                  className={`ruler-tick y ${major ? 'major' : ''}`}
+                  style={{ top: `calc(50% + ${px}px)` }}
+                >
                   {major ? <span>{mm}mm</span> : null}
                 </div>
               )
             })}
           </div>
 
-          {snapGuides.x !== null ? <div className="snap-line vertical" style={{ left: `calc(50% + ${snapGuides.x}px)` }} /> : null}
-          {snapGuides.y !== null ? <div className="snap-line horizontal" style={{ top: `calc(50% + ${snapGuides.y}px)` }} /> : null}
+          {snapGuides.x !== null ? (
+            <div className="snap-line vertical" style={{ left: `calc(50% + ${snapGuides.x}px)` }} />
+          ) : null}
+          {snapGuides.y !== null ? (
+            <div
+              className="snap-line horizontal"
+              style={{ top: `calc(50% + ${snapGuides.y}px)` }}
+            />
+          ) : null}
 
           {projectionStyle ? (
             <div className="projection-overlay" style={projectionStyle}>
@@ -878,14 +919,18 @@ function App(): React.JSX.Element {
             </div>
           ) : null}
 
-          <div className="device-rect local" style={{ width: localRect.width, height: localRect.height }}>
+          <div
+            className="device-rect local"
+            style={{ width: localRect.width, height: localRect.height }}
+          >
             <h3>{compare.local.name} (本机)</h3>
             <p>
-              {compare.local.resolution.width} x {compare.local.resolution.height} @ {compare.local.dpi} DPI
+              {compare.local.resolution.width} x {compare.local.resolution.height} @{' '}
+              {compare.local.dpi} DPI
             </p>
             <p>
               估算: {localPhysical.widthMm.toFixed(1)}mm x {localPhysical.heightMm.toFixed(1)}mm /{' '}
-              {localPhysical.diagonalInch.toFixed(1)}"
+              {localPhysical.diagonalInch.toFixed(1)}&quot;
             </p>
           </div>
 
@@ -901,13 +946,16 @@ function App(): React.JSX.Element {
           >
             <h3>{compare.remote.name}</h3>
             <p>
-              {compare.remote.resolution.width} x {compare.remote.resolution.height} @ {compare.remote.dpi} DPI
+              {compare.remote.resolution.width} x {compare.remote.resolution.height} @{' '}
+              {compare.remote.dpi} DPI
             </p>
             <p>
               估算: {remotePhysical.widthMm.toFixed(1)}mm x {remotePhysical.heightMm.toFixed(1)}mm /{' '}
-              {remotePhysical.diagonalInch.toFixed(1)}"
+              {remotePhysical.diagonalInch.toFixed(1)}&quot;
             </p>
-            <p className="meta">DPI来源: {remotePhysical.dpiSource === 'reported' ? '设备上报' : '系统估算'}</p>
+            <p className="meta">
+              DPI来源: {remotePhysical.dpiSource === 'reported' ? '设备上报' : '系统估算'}
+            </p>
           </div>
         </section>
       </main>
@@ -943,7 +991,9 @@ function App(): React.JSX.Element {
             : null}
           <p className="pair-line">1) 手机开启开发者选项与 USB 调试。</p>
           <p className="pair-line">2) USB 连接后，在手机上点击“允许 USB 调试”。</p>
-          <p className="pair-line">3) 如需无线调试，请先 USB 配对后执行 adb tcpip / adb connect。</p>
+          <p className="pair-line">
+            3) 如需无线调试，请先 USB 配对后执行 adb tcpip / adb connect。
+          </p>
           <div className="adb-connect-row">
             <input
               className="search-input adb-connect-input"
@@ -961,7 +1011,9 @@ function App(): React.JSX.Element {
             </button>
           </div>
           {adbConnectResult ? (
-            <p className={adbConnectResult.ok ? 'debug-line' : 'debug-error'}>ADB连接结果: {adbConnectResult.message}</p>
+            <p className={adbConnectResult.ok ? 'debug-line' : 'debug-error'}>
+              ADB连接结果: {adbConnectResult.message}
+            </p>
           ) : null}
         </section>
 
@@ -987,7 +1039,10 @@ function App(): React.JSX.Element {
           <span>匹配结果: {filteredDevices.length}</span>
         </div>
 
-        <div className="virtual-list" onScroll={(event) => setScrollTop(event.currentTarget.scrollTop)}>
+        <div
+          className="virtual-list"
+          onScroll={(event) => setScrollTop(event.currentTarget.scrollTop)}
+        >
           <div style={{ height: topSpacerHeight }} />
 
           {visibleRows.map((device) => {
@@ -1017,7 +1072,9 @@ function App(): React.JSX.Element {
           <div style={{ height: bottomSpacerHeight }} />
         </div>
 
-        {totalCount === 0 ? <p className="empty">当前没有可用设备，请确认 adb 授权或局域网 UDP 可互通。</p> : null}
+        {totalCount === 0 ? (
+          <p className="empty">当前没有可用设备，请确认 adb 授权或局域网 UDP 可互通。</p>
+        ) : null}
         {error ? <p className="error">{error}</p> : null}
 
         <section className="debug-panel">
@@ -1030,12 +1087,17 @@ function App(): React.JSX.Element {
               <p className="debug-line">最近扫描: {toTimeLabel(debugInfo.lastSweepAt)}</p>
               <p className="debug-line">最近 adb 读取: {toTimeLabel(debugInfo.lastArpReadAt)}</p>
               <p className="debug-line">连接设备数: {debugInfo.lastArpNeighborCount}</p>
-              <p className="debug-line">设备序列号: {debugInfo.lastArpNeighbors.join(', ') || '--'}</p>
               <p className="debug-line">
-                扫描计数: {debugInfo.discoverRequestSentCount} / 响应计数: {debugInfo.discoverResponseReceivedCount}
+                设备序列号: {debugInfo.lastArpNeighbors.join(', ') || '--'}
+              </p>
+              <p className="debug-line">
+                扫描计数: {debugInfo.discoverRequestSentCount} / 响应计数:{' '}
+                {debugInfo.discoverResponseReceivedCount}
               </p>
               {diagnosis ? <p className="debug-error">诊断: {diagnosis}</p> : null}
-              {debugInfo.lastError ? <p className="debug-error">最近错误: {debugInfo.lastError}</p> : null}
+              {debugInfo.lastError ? (
+                <p className="debug-error">最近错误: {debugInfo.lastError}</p>
+              ) : null}
             </>
           )}
         </section>
