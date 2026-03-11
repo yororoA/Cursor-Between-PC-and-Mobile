@@ -19,6 +19,27 @@ type DeviceRecord = {
   lastSeen: number
 }
 
+type DiscoveryDebugSnapshot = {
+  startedAt: number
+  lastAnnounceAt: number
+  lastSweepAt: number
+  lastArpReadAt: number
+  lastArpNeighborCount: number
+  lastArpNeighbors: string[]
+  broadcastAddresses: string[]
+  localAddresses: string[]
+  announceSentCount: number
+  discoverRequestSentCount: number
+  discoverResponseSentCount: number
+  announceReceivedCount: number
+  discoverRequestReceivedCount: number
+  discoverResponseReceivedCount: number
+  infoResponseReceivedCount: number
+  lastIncomingAt: number
+  lastIncomingFrom: string
+  lastError: string
+}
+
 type WireMessage =
   | {
       type: 'announce'
@@ -57,6 +78,7 @@ type WireMessage =
 const DISCOVERY_PORT = 42425
 const BROADCAST_ADDRESS = '255.255.255.255'
 const ANNOUNCE_INTERVAL_MS = 3_000
+const DISCOVERY_SWEEP_INTERVAL_MS = 12_000
 const PEER_TTL_MS = 10_000
 
 const localDeviceId = randomUUID()
@@ -65,10 +87,53 @@ const localDeviceName = os.hostname()
 let mainWindowRef: BrowserWindow | null = null
 let discoverySocket: Socket | null = null
 let announceTimer: NodeJS.Timeout | null = null
+let discoverySweepTimer: NodeJS.Timeout | null = null
 let pruneTimer: NodeJS.Timeout | null = null
 
 const peers = new Map<string, DeviceRecord>()
 const pendingRequests = new Map<string, (device: DeviceRecord) => void>()
+const debugState: DiscoveryDebugSnapshot = {
+  startedAt: Date.now(),
+  lastAnnounceAt: 0,
+  lastSweepAt: 0,
+  lastArpReadAt: 0,
+  lastArpNeighborCount: 0,
+  lastArpNeighbors: [],
+  broadcastAddresses: [],
+  localAddresses: [],
+  announceSentCount: 0,
+  discoverRequestSentCount: 0,
+  discoverResponseSentCount: 0,
+  announceReceivedCount: 0,
+  discoverRequestReceivedCount: 0,
+  discoverResponseReceivedCount: 0,
+  infoResponseReceivedCount: 0,
+  lastIncomingAt: 0,
+  lastIncomingFrom: '',
+  lastError: ''
+}
+
+function getLocalIPv4Addresses(): string[] {
+  const localAddresses = new Set<string>()
+  const interfaces = os.networkInterfaces()
+  for (const entries of Object.values(interfaces)) {
+    if (!entries) continue
+    for (const item of entries) {
+      if (item.family === 'IPv4' && item.address) {
+        localAddresses.add(item.address)
+      }
+    }
+  }
+  return Array.from(localAddresses)
+}
+
+function getDiscoveryDebugSnapshot(): DiscoveryDebugSnapshot {
+  return {
+    ...debugState,
+    lastArpNeighbors: [...debugState.lastArpNeighbors],
+    broadcastAddresses: [...debugState.broadcastAddresses]
+  }
+}
 
 function createLocalDeviceRecord(): DeviceRecord {
   const display = screen.getPrimaryDisplay()
@@ -108,6 +173,14 @@ function sendWireMessage(message: WireMessage, address = BROADCAST_ADDRESS): voi
   if (!discoverySocket) return
   const content = Buffer.from(JSON.stringify(message), 'utf-8')
   discoverySocket.send(content, DISCOVERY_PORT, address)
+
+  if (message.type === 'announce') {
+    debugState.announceSentCount += 1
+  } else if (message.type === 'discover-request') {
+    debugState.discoverRequestSentCount += 1
+  } else if (message.type === 'discover-response') {
+    debugState.discoverResponseSentCount += 1
+  }
 }
 
 function getBroadcastAddressesFromInterfaces(): string[] {
@@ -170,7 +243,10 @@ async function getArpNeighborAddresses(): Promise<string[]> {
 
   for (const match of output.matchAll(ipRegex)) {
     const ip = match[1]
-    if (!ip || ip.startsWith('224.') || ip === '255.255.255.255' || ip.endsWith('.255')) continue
+    if (!ip) continue
+    const firstOctet = Number(ip.split('.')[0])
+    if (firstOctet >= 224 || firstOctet === 0 || firstOctet === 127) continue
+    if (ip === '255.255.255.255' || ip.endsWith('.255')) continue
     if (localIps.has(ip)) continue
     neighbors.add(ip)
   }
@@ -180,6 +256,8 @@ async function getArpNeighborAddresses(): Promise<string[]> {
 
 async function triggerActiveDiscovery(): Promise<void> {
   if (!discoverySocket) return
+  debugState.lastSweepAt = Date.now()
+  debugState.localAddresses = getLocalIPv4Addresses()
 
   const requestId = randomUUID()
   const probe: WireMessage = {
@@ -189,21 +267,36 @@ async function triggerActiveDiscovery(): Promise<void> {
     }
   }
 
-  for (const address of getBroadcastAddressesFromInterfaces()) {
+  const broadcastAddresses = getBroadcastAddressesFromInterfaces()
+  debugState.broadcastAddresses = broadcastAddresses
+
+  for (const address of broadcastAddresses) {
     sendWireMessage(probe, address)
   }
 
   const arpNeighbors = await getArpNeighborAddresses()
+  debugState.lastArpReadAt = Date.now()
+  debugState.lastArpNeighborCount = arpNeighbors.length
+  debugState.lastArpNeighbors = arpNeighbors.slice(0, 60)
   for (const address of arpNeighbors) {
     sendWireMessage(probe, address)
   }
 }
 
 function announceSelf(): void {
-  sendWireMessage({
+  debugState.lastAnnounceAt = Date.now()
+  debugState.localAddresses = getLocalIPv4Addresses()
+  const announceMessage: WireMessage = {
     type: 'announce',
     payload: createLocalDeviceRecord()
-  })
+  }
+
+  // Use subnet broadcast addresses to improve discovery on mobile hotspot networks.
+  const broadcastAddresses = getBroadcastAddressesFromInterfaces()
+  debugState.broadcastAddresses = broadcastAddresses
+  for (const address of broadcastAddresses) {
+    sendWireMessage(announceMessage, address)
+  }
 }
 
 function handleWireMessage(raw: Buffer, remoteAddress: string): void {
@@ -217,7 +310,11 @@ function handleWireMessage(raw: Buffer, remoteAddress: string): void {
 
   if (!parsed) return
 
+  debugState.lastIncomingAt = Date.now()
+  debugState.lastIncomingFrom = remoteAddress
+
   if (parsed.type === 'announce') {
+    debugState.announceReceivedCount += 1
     const peer = {
       ...parsed.payload,
       address: remoteAddress,
@@ -245,6 +342,7 @@ function handleWireMessage(raw: Buffer, remoteAddress: string): void {
   }
 
   if (parsed.type === 'discover-request') {
+    debugState.discoverRequestReceivedCount += 1
     sendWireMessage(
       {
         type: 'discover-response',
@@ -259,6 +357,7 @@ function handleWireMessage(raw: Buffer, remoteAddress: string): void {
   }
 
   if (parsed.type === 'discover-response') {
+    debugState.discoverResponseReceivedCount += 1
     const remoteDevice = {
       ...parsed.payload.device,
       address: remoteAddress,
@@ -270,6 +369,7 @@ function handleWireMessage(raw: Buffer, remoteAddress: string): void {
 
   if (parsed.type === 'info-response') {
     if (parsed.payload.targetId !== localDeviceId) return
+    debugState.infoResponseReceivedCount += 1
 
     const remoteDevice = {
       ...parsed.payload.device,
@@ -309,23 +409,30 @@ function startDiscoveryService(): void {
   })
 
   socket.on('error', (error) => {
+    debugState.lastError = String(error)
     console.error('LAN discovery socket error:', error)
   })
 
   socket.bind(DISCOVERY_PORT, () => {
     socket.setBroadcast(true)
+    debugState.localAddresses = getLocalIPv4Addresses()
     announceSelf()
     void triggerActiveDiscovery()
   })
 
   announceTimer = setInterval(announceSelf, ANNOUNCE_INTERVAL_MS)
+  discoverySweepTimer = setInterval(() => {
+    void triggerActiveDiscovery()
+  }, DISCOVERY_SWEEP_INTERVAL_MS)
   pruneTimer = setInterval(prunePeers, 1_500)
 }
 
 function stopDiscoveryService(): void {
   if (announceTimer) clearInterval(announceTimer)
+  if (discoverySweepTimer) clearInterval(discoverySweepTimer)
   if (pruneTimer) clearInterval(pruneTimer)
   announceTimer = null
+  discoverySweepTimer = null
   pruneTimer = null
 
   if (discoverySocket) {
@@ -433,6 +540,10 @@ app.whenReady().then(() => {
     announceSelf()
     await triggerActiveDiscovery()
     return true
+  })
+
+  ipcMain.handle('lan:get-discovery-debug', () => {
+    return getDiscoveryDebugSnapshot()
   })
 
   startDiscoveryService()

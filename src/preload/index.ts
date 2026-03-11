@@ -7,6 +7,7 @@ const api = {
   getLocalDevice: () => ipcRenderer.invoke('lan:get-local-device'),
   requestDeviceInfo: (deviceId: string) => ipcRenderer.invoke('lan:request-device-info', deviceId),
   refreshDiscovery: () => ipcRenderer.invoke('lan:refresh-discovery'),
+  getDiscoveryDebug: () => ipcRenderer.invoke('lan:get-discovery-debug'),
   onDevicesUpdated: (callback: (devices: unknown[]) => void) => {
     const listener = (_event: unknown, devices: unknown[]) => callback(devices)
     ipcRenderer.on('lan:devices-updated', listener)

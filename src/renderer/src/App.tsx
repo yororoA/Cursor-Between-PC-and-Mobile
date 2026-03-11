@@ -17,9 +17,35 @@ type ComparePayload = {
   remote: DeviceInfo
 }
 
+type DiscoveryDebugInfo = {
+  startedAt: number
+  lastAnnounceAt: number
+  lastSweepAt: number
+  lastArpReadAt: number
+  lastArpNeighborCount: number
+  lastArpNeighbors: string[]
+  broadcastAddresses: string[]
+  localAddresses: string[]
+  announceSentCount: number
+  discoverRequestSentCount: number
+  discoverResponseSentCount: number
+  announceReceivedCount: number
+  discoverRequestReceivedCount: number
+  discoverResponseReceivedCount: number
+  infoResponseReceivedCount: number
+  lastIncomingAt: number
+  lastIncomingFrom: string
+  lastError: string
+}
+
 const LIST_HEIGHT = 420
 const ROW_HEIGHT = 62
 const OVERSCAN = 6
+
+function toTimeLabel(value: number): string {
+  if (!value) return '--'
+  return new Date(value).toLocaleTimeString()
+}
 
 function toPhysical(device: DeviceInfo): {
   widthMm: number
@@ -62,6 +88,7 @@ function App(): React.JSX.Element {
   const [compare, setCompare] = useState<ComparePayload | null>(null)
   const [dragOffset, setDragOffset] = useState({ x: 260, y: 20 })
   const [refreshing, setRefreshing] = useState(false)
+  const [debugInfo, setDebugInfo] = useState<DiscoveryDebugInfo | null>(null)
   const dragStateRef = useRef<{ active: boolean; startX: number; startY: number; x: number; y: number }>({
     active: false,
     startX: 0,
@@ -86,8 +113,23 @@ function App(): React.JSX.Element {
       setDevices(nextDevices)
     })
 
+    const updateDebug = (): void => {
+      window.api
+        .getDiscoveryDebug()
+        .then((nextDebug) => {
+          if (mounted) setDebugInfo(nextDebug)
+        })
+        .catch(() => {
+          if (mounted) setDebugInfo(null)
+        })
+    }
+
+    updateDebug()
+    const timer = window.setInterval(updateDebug, 2000)
+
     return () => {
       mounted = false
+      window.clearInterval(timer)
       dispose()
     }
   }, [])
@@ -126,6 +168,26 @@ function App(): React.JSX.Element {
       )
     })
   }, [devices, query])
+
+  const diagnosis = useMemo(() => {
+    if (!debugInfo) return ''
+    const hasAnyInbound = debugInfo.lastIncomingAt > 0
+    const selfLoopOnly =
+      hasAnyInbound &&
+      !!debugInfo.lastIncomingFrom &&
+      debugInfo.localAddresses.includes(debugInfo.lastIncomingFrom) &&
+      devices.length === 0
+
+    if (selfLoopOnly) {
+      return '当前主要收到本机回环报文。请在两台设备都放行 UDP 42425 入站(公用网络/专用网络)，并关闭热点的设备隔离。'
+    }
+
+    if (debugInfo.lastArpNeighborCount > 0 && debugInfo.announceReceivedCount === 0 && devices.length === 0) {
+      return 'ARP 已发现邻居，但未收到任何对端广播。通常是防火墙或对端应用未启动。'
+    }
+
+    return ''
+  }, [debugInfo, devices.length])
 
   const totalCount = filteredDevices.length
   const startIndex = Math.max(0, Math.floor(scrollTop / ROW_HEIGHT) - OVERSCAN)
@@ -295,6 +357,36 @@ function App(): React.JSX.Element {
 
         {totalCount === 0 ? <p className="empty">当前没有可用设备，请确认其他设备已启动应用且处于同一局域网。</p> : null}
         {error ? <p className="error">{error}</p> : null}
+
+        <section className="debug-panel">
+          <h2>发现调试</h2>
+          {!debugInfo ? (
+            <p className="debug-line">调试信息暂不可用</p>
+          ) : (
+            <>
+              <p className="debug-line">启动时间: {toTimeLabel(debugInfo.startedAt)}</p>
+              <p className="debug-line">最近 announce: {toTimeLabel(debugInfo.lastAnnounceAt)}</p>
+              <p className="debug-line">最近 sweep: {toTimeLabel(debugInfo.lastSweepAt)}</p>
+              <p className="debug-line">最近 ARP 读取: {toTimeLabel(debugInfo.lastArpReadAt)}</p>
+              <p className="debug-line">ARP 邻居数: {debugInfo.lastArpNeighborCount}</p>
+              <p className="debug-line">广播地址: {debugInfo.broadcastAddresses.join(', ') || '--'}</p>
+              <p className="debug-line">本机地址: {debugInfo.localAddresses.join(', ') || '--'}</p>
+              <p className="debug-line">最近入站来源: {debugInfo.lastIncomingFrom || '--'}</p>
+              <p className="debug-line">最近入站时间: {toTimeLabel(debugInfo.lastIncomingAt)}</p>
+              <p className="debug-line">
+                发送计数: announce {debugInfo.announceSentCount}, discover-request {debugInfo.discoverRequestSentCount},
+                discover-response {debugInfo.discoverResponseSentCount}
+              </p>
+              <p className="debug-line">
+                接收计数: announce {debugInfo.announceReceivedCount}, discover-request {debugInfo.discoverRequestReceivedCount},
+                discover-response {debugInfo.discoverResponseReceivedCount}, info-response {debugInfo.infoResponseReceivedCount}
+              </p>
+              <p className="debug-line">ARP 邻居样本: {debugInfo.lastArpNeighbors.join(', ') || '--'}</p>
+              {diagnosis ? <p className="debug-error">诊断: {diagnosis}</p> : null}
+              {debugInfo.lastError ? <p className="debug-error">最近错误: {debugInfo.lastError}</p> : null}
+            </>
+          )}
+        </section>
       </section>
     </main>
   )

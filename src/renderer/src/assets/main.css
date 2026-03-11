@@ -3,7 +3,8 @@
 body {
   margin: 0;
   min-height: 100vh;
-  overflow: hidden;
+  overflow-x: hidden;
+  overflow-y: auto;
   background:
     radial-gradient(circle at 15% 20%, #f9d37e 0%, rgba(249, 211, 126, 0) 32%),
     radial-gradient(circle at 82% 78%, #8ec9ff 0%, rgba(142, 201, 255, 0) 38%),
@@ -142,6 +143,34 @@ body {
 
 .error {
   color: #ff9a9a;
+}
+
+.debug-panel {
+  margin-top: 12px;
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  border-radius: 12px;
+  padding: 10px 12px;
+  background: rgba(2, 8, 15, 0.55);
+}
+
+.debug-panel h2 {
+  margin: 0 0 8px;
+  font-size: 14px;
+  color: rgba(255, 255, 255, 0.88);
+}
+
+.debug-line {
+  margin: 4px 0;
+  font-size: 12px;
+  color: rgba(255, 255, 255, 0.76);
+  word-break: break-all;
+}
+
+.debug-error {
+  margin: 6px 0 0;
+  font-size: 12px;
+  color: #ff9a9a;
+  word-break: break-all;
 }
 
 .compare-shell {
