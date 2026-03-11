@@ -121,9 +121,9 @@ type WireMessage =
   | { type: 'announce'; payload: DeviceRecord }
   | { type: 'query-info'; payload: { requesterId: string; targetId: string; requestId: string } }
   | {
-      type: 'info-response'
-      payload: { requestId: string; targetId: string; device: DeviceRecord }
-    }
+    type: 'info-response'
+    payload: { requestId: string; targetId: string; device: DeviceRecord }
+  }
   | { type: 'discover-request'; payload: { requestId: string } }
   | { type: 'discover-response'; payload: { requestId: string; device: DeviceRecord } }
 
@@ -274,29 +274,30 @@ function createPairPageHtml(): string {
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Device Bridge Pair</title>
   <style>
-    body { font-family: -apple-system, BlinkMacSystemFont, Segoe UI, Roboto, sans-serif; margin: 0; padding: 16px; background: #0f1720; color: #f3f6fa; }
-    .card { max-width: 680px; margin: 0 auto; border: 1px solid #2a3a4c; border-radius: 14px; padding: 16px; background: #152231; }
-    h1 { margin: 0 0 10px; font-size: 22px; }
-    p { margin: 8px 0; color: #d3deea; }
+    html, body { width: 100%; height: 100%; }
+    body { font-family: -apple-system, BlinkMacSystemFont, Segoe UI, Roboto, sans-serif; margin: 0; background: #000; color: #f3f6fa; overflow: hidden; }
+    #projection { position: fixed; inset: 0; width: 100vw; height: 100vh; object-fit: contain; background: #000; }
+    .hud { position: fixed; left: 10px; right: 10px; top: 10px; z-index: 2; display: grid; gap: 8px; pointer-events: none; }
+    .pill { width: fit-content; max-width: 96vw; padding: 8px 10px; border-radius: 10px; border: 1px solid rgba(255,255,255,0.24); background: rgba(8, 18, 28, 0.72); backdrop-filter: blur(8px); font-size: 12px; }
     .ok { color: #7ce0ab; }
     .warn { color: #ffd17a; }
     .bad { color: #ff9a9a; }
-    .meta { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12px; color: #9fc0dc; word-break: break-all; }
-    .screen { margin-top: 12px; border: 1px solid #385472; border-radius: 12px; overflow: hidden; background: #08121d; }
-    .screen img { display: block; width: 100%; min-height: 180px; object-fit: cover; background: #0a1624; }
-    .screen .caption { padding: 8px 10px; font-size: 12px; color: #b8d4ec; border-top: 1px solid #2a3a4c; }
+    .meta { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; color: #9fc0dc; word-break: break-all; }
+    .caption { color: #b8d4ec; }
+    .controls { display: flex; gap: 8px; pointer-events: auto; }
+    .btn { border: 1px solid rgba(255,255,255,0.25); background: rgba(255,255,255,0.12); color: #fff; border-radius: 9px; padding: 8px 10px; font-size: 12px; }
+    body.has-frame .meta { display: none; }
   </style>
 </head>
 <body>
-  <div class="card">
-    <h1>Phone Connected</h1>
-    <p>Keep this page open in foreground. It receives real-time projection frames from desktop.</p>
-    <p id="status" class="ok">Connecting...</p>
-    <p id="stream" class="warn">Projection stream: waiting...</p>
-    <p id="meta" class="meta"></p>
-    <div class="screen">
-      <img id="projection" alt="Projection Frame" />
-      <div id="caption" class="caption">No projection frame yet</div>
+  <img id="projection" alt="Projection Frame" />
+  <div class="hud">
+    <div id="status" class="pill ok">Connecting...</div>
+    <div id="stream" class="pill warn">Projection stream: waiting...</div>
+    <div id="caption" class="pill caption">No projection frame yet</div>
+    <div id="meta" class="pill meta"></div>
+    <div class="controls">
+      <button id="fullscreenBtn" class="btn" type="button">进入全屏</button>
     </div>
   </div>
   <script>
@@ -312,7 +313,27 @@ function createPairPageHtml(): string {
     const metaEl = document.getElementById('meta');
     const projectionEl = document.getElementById('projection');
     const captionEl = document.getElementById('caption');
+    const fullscreenBtn = document.getElementById('fullscreenBtn');
+    let hasFrame = false;
     let source = null;
+
+    function tryEnterFullscreen() {
+      const el = document.documentElement;
+      if (!el || document.fullscreenElement) return;
+      if (el.requestFullscreen) {
+        el.requestFullscreen().catch(function () {});
+      }
+    }
+
+    if (fullscreenBtn) {
+      fullscreenBtn.addEventListener('click', function () {
+        tryEnterFullscreen();
+      });
+    }
+
+    projectionEl.addEventListener('dblclick', function () {
+      tryEnterFullscreen();
+    });
 
     function postAck(sessionId, frameId) {
       return fetch('/api/projection/ack', {
@@ -349,6 +370,10 @@ function createPairPageHtml(): string {
           const imageDataUrl = data.imageDataUrl || '';
 
           if (imageDataUrl) {
+            if (!hasFrame) {
+              hasFrame = true;
+              document.body.classList.add('has-frame');
+            }
             projectionEl.src = imageDataUrl;
             captionEl.textContent = 'Session ' + sessionId.slice(0, 8) + ' frame #' + frameId;
           }
