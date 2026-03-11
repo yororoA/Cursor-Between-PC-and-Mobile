@@ -451,6 +451,42 @@ function App(): React.JSX.Element {
     return cropCanvas.toDataURL('image/jpeg', 0.78)
   }
 
+  function captureFullScreenImage(): {
+    imageDataUrl: string
+    width: number
+    height: number
+  } {
+    const video = captureVideoRef.current
+    if (!video || video.readyState < 2) {
+      return { imageDataUrl: '', width: 0, height: 0 }
+    }
+
+    const sourceW = video.videoWidth
+    const sourceH = video.videoHeight
+    if (!sourceW || !sourceH) {
+      return { imageDataUrl: '', width: 0, height: 0 }
+    }
+
+    const fullCanvas = captureCanvasRef.current || document.createElement('canvas')
+    fullCanvas.width = sourceW
+    fullCanvas.height = sourceH
+    captureCanvasRef.current = fullCanvas
+
+    const fullCtx = fullCanvas.getContext('2d')
+    if (!fullCtx) {
+      return { imageDataUrl: '', width: 0, height: 0 }
+    }
+
+    fullCtx.clearRect(0, 0, sourceW, sourceH)
+    fullCtx.drawImage(video, 0, 0, sourceW, sourceH)
+
+    return {
+      imageDataUrl: fullCanvas.toDataURL('image/jpeg', 0.78),
+      width: sourceW,
+      height: sourceH
+    }
+  }
+
   useEffect(() => {
     const stage = stageRef.current
     if (!stage || !compare) return
@@ -728,16 +764,17 @@ function App(): React.JSX.Element {
         localBounds,
         compare.local.resolution
       )
-      const imageDataUrl = captureCropFromFullScreen(crop, compare.local.resolution)
+      const fullFrame = captureFullScreenImage()
+      const imageDataUrl = fullFrame.imageDataUrl
       if (!imageDataUrl) return
 
       void window.api.projectionPush(projectionSessionId, {
         imageDataUrl,
         overlap: {
-          width: crop.width,
-          height: crop.height,
-          left: crop.x,
-          top: crop.y
+          width: fullFrame.width,
+          height: fullFrame.height,
+          left: 0,
+          top: 0
         }
       })
     }, 320)
