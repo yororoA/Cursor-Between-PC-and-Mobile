@@ -9,6 +9,7 @@ const api = {
   refreshDiscovery: () => ipcRenderer.invoke('lan:refresh-discovery'),
   getDiscoveryDebug: () => ipcRenderer.invoke('lan:get-discovery-debug'),
   getPairingInfo: () => ipcRenderer.invoke('lan:get-pairing-info'),
+  capturePrimaryFrame: () => ipcRenderer.invoke('lan:capture-primary-frame'),
   adbConnect: (target: string) => ipcRenderer.invoke('lan:adb-connect', target),
   projectionStart: (targetDeviceId: string) =>
     ipcRenderer.invoke('lan:projection-start', targetDeviceId),

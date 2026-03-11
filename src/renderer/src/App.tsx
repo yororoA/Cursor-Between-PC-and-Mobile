@@ -260,11 +260,6 @@ function App(): React.JSX.Element {
   const [stageSize, setStageSize] = useState({ width: 900, height: 540 })
   const [screenCaptureReady, setScreenCaptureReady] = useState(false)
   const stageRef = useRef<HTMLElement | null>(null)
-  const captureStreamRef = useRef<MediaStream | null>(null)
-  const captureVideoRef = useRef<HTMLVideoElement | null>(null)
-  const captureCanvasRef = useRef<HTMLCanvasElement | null>(null)
-  const cropCanvasRef = useRef<HTMLCanvasElement | null>(null)
-  const captureProbeCanvasRef = useRef<HTMLCanvasElement | null>(null)
   const dragStateRef = useRef<{ active: boolean; startX: number; startY: number; x: number; y: number }>({
     active: false,
     startX: 0,
@@ -366,162 +361,45 @@ function App(): React.JSX.Element {
       if (projectionSessionId) {
         void window.api.projectionStop(projectionSessionId)
       }
-      const stream = captureStreamRef.current
-      if (stream) {
-        for (const track of stream.getTracks()) {
-          track.stop()
-        }
-      }
     }
   }, [projectionSessionId])
 
   async function ensureScreenCaptureReady(): Promise<boolean> {
-    if (captureStreamRef.current && captureVideoRef.current?.readyState >= 2) {
-      return true
-    }
-
     try {
-      const videoConstraints = {
-        frameRate: { ideal: 12, max: 15 },
-        displaySurface: 'monitor',
-        // Electron/Chromium 扩展约束，尽量避免抓到当前应用表面导致黑帧。
-        selfBrowserSurface: 'exclude',
-        surfaceSwitching: 'exclude'
-      } as MediaTrackConstraints
-
-      const stream = await navigator.mediaDevices.getDisplayMedia({
-        video: videoConstraints,
-        audio: false
-      })
-
-      const video = document.createElement('video')
-      video.srcObject = stream
-      video.muted = true
-      video.playsInline = true
-      await video.play()
-
-      await new Promise((resolve) => window.setTimeout(resolve, 120))
-
-      const probeCanvas = captureProbeCanvasRef.current || document.createElement('canvas')
-      probeCanvas.width = 32
-      probeCanvas.height = 18
-      captureProbeCanvasRef.current = probeCanvas
-      const probeCtx = probeCanvas.getContext('2d', { willReadFrequently: true })
-      if (!probeCtx) {
-        throw new Error('采集探针初始化失败')
-      }
-      probeCtx.clearRect(0, 0, probeCanvas.width, probeCanvas.height)
-      probeCtx.drawImage(video, 0, 0, probeCanvas.width, probeCanvas.height)
-      const data = probeCtx.getImageData(0, 0, probeCanvas.width, probeCanvas.height).data
-      let brightPixels = 0
-      for (let i = 0; i < data.length; i += 4) {
-        const r = data[i] || 0
-        const g = data[i + 1] || 0
-        const b = data[i + 2] || 0
-        const a = data[i + 3] || 0
-        if (a > 8 && r + g + b > 18) brightPixels += 1
-      }
-      if (brightPixels < 10) {
-        for (const track of stream.getTracks()) {
-          track.stop()
-        }
-        captureStreamRef.current = null
-        captureVideoRef.current = null
+      const frame = await window.api.capturePrimaryFrame()
+      if (!frame.ok || !frame.imageDataUrl) {
         setScreenCaptureReady(false)
-        setProjectionStatusText('检测到黑屏采集，请在授权弹窗中选择“整个屏幕（非当前应用窗口）”后重试')
+        setProjectionStatusText(frame.message || '主进程截图失败')
         return false
       }
 
-      captureStreamRef.current = stream
-      captureVideoRef.current = video
       setScreenCaptureReady(true)
       return true
     } catch {
       setScreenCaptureReady(false)
-      setProjectionStatusText('未获得整屏采集权限，请在弹窗中选择“整个屏幕”')
+      setProjectionStatusText('主进程截图异常')
       return false
     }
   }
 
-  function captureCropFromFullScreen(
-    crop: PixelCrop,
-    localResolution: { width: number; height: number }
-  ): string {
-    const video = captureVideoRef.current
-    if (!video || video.readyState < 2) return ''
-
-    const sourceW = video.videoWidth
-    const sourceH = video.videoHeight
-    if (!sourceW || !sourceH) return ''
-
-    const fullCanvas = captureCanvasRef.current || document.createElement('canvas')
-    fullCanvas.width = sourceW
-    fullCanvas.height = sourceH
-    captureCanvasRef.current = fullCanvas
-
-    const fullCtx = fullCanvas.getContext('2d')
-    if (!fullCtx) return ''
-    fullCtx.drawImage(video, 0, 0, sourceW, sourceH)
-
-    const scaleX = sourceW / Math.max(1, localResolution.width)
-    const scaleY = sourceH / Math.max(1, localResolution.height)
-
-    const scaledX = Math.round(crop.x * scaleX)
-    const scaledY = Math.round(crop.y * scaleY)
-    const scaledWidth = Math.max(1, Math.round(crop.width * scaleX))
-    const scaledHeight = Math.max(1, Math.round(crop.height * scaleY))
-
-    const cropX = Math.max(0, Math.min(sourceW - 1, scaledX))
-    const cropY = Math.max(0, Math.min(sourceH - 1, scaledY))
-    const cropWidth = Math.max(1, Math.min(sourceW - cropX, scaledWidth))
-    const cropHeight = Math.max(1, Math.min(sourceH - cropY, scaledHeight))
-
-    const cropCanvas = cropCanvasRef.current || document.createElement('canvas')
-    cropCanvas.width = cropWidth
-    cropCanvas.height = cropHeight
-    cropCanvasRef.current = cropCanvas
-
-    const cropCtx = cropCanvas.getContext('2d')
-    if (!cropCtx) return ''
-    cropCtx.clearRect(0, 0, cropWidth, cropHeight)
-    cropCtx.drawImage(fullCanvas, cropX, cropY, cropWidth, cropHeight, 0, 0, cropWidth, cropHeight)
-
-    return cropCanvas.toDataURL('image/jpeg', 0.78)
-  }
-
-  function captureFullScreenImage(): {
+  async function captureFullScreenImage(): Promise<{
     imageDataUrl: string
     width: number
     height: number
-  } {
-    const video = captureVideoRef.current
-    if (!video || video.readyState < 2) {
+  }> {
+    const frame = await window.api.capturePrimaryFrame()
+    if (!frame.ok || !frame.imageDataUrl) {
+      setScreenCaptureReady(false)
+      setProjectionStatusText(frame.message || '主进程截图失败')
       return { imageDataUrl: '', width: 0, height: 0 }
     }
 
-    const sourceW = video.videoWidth
-    const sourceH = video.videoHeight
-    if (!sourceW || !sourceH) {
-      return { imageDataUrl: '', width: 0, height: 0 }
-    }
-
-    const fullCanvas = captureCanvasRef.current || document.createElement('canvas')
-    fullCanvas.width = sourceW
-    fullCanvas.height = sourceH
-    captureCanvasRef.current = fullCanvas
-
-    const fullCtx = fullCanvas.getContext('2d')
-    if (!fullCtx) {
-      return { imageDataUrl: '', width: 0, height: 0 }
-    }
-
-    fullCtx.clearRect(0, 0, sourceW, sourceH)
-    fullCtx.drawImage(video, 0, 0, sourceW, sourceH)
+    setScreenCaptureReady(true)
 
     return {
-      imageDataUrl: fullCanvas.toDataURL('image/jpeg', 0.78),
-      width: sourceW,
-      height: sourceH
+      imageDataUrl: frame.imageDataUrl,
+      width: frame.width,
+      height: frame.height
     }
   }
 
@@ -782,39 +660,36 @@ function App(): React.JSX.Element {
     if (!compare || !compareLayout || !connectionSnapshot || !projectionSessionId) return
 
     const timer = window.setInterval(() => {
-      const localBounds = rectFromCenter(
-        connectionSnapshot.localOffset.x,
-        connectionSnapshot.localOffset.y,
-        compareLayout.localRect.width,
-        compareLayout.localRect.height
-      )
-      const remoteBounds = rectFromCenter(
-        connectionSnapshot.remoteOffset.x,
-        connectionSnapshot.remoteOffset.y,
-        compareLayout.remoteRect.width,
-        compareLayout.remoteRect.height
-      )
-      const overlapRect = getOverlapRect(localBounds, remoteBounds)
-      if (!overlapRect) return
+      void (async () => {
+        const localBounds = rectFromCenter(
+          connectionSnapshot.localOffset.x,
+          connectionSnapshot.localOffset.y,
+          compareLayout.localRect.width,
+          compareLayout.localRect.height
+        )
+        const remoteBounds = rectFromCenter(
+          connectionSnapshot.remoteOffset.x,
+          connectionSnapshot.remoteOffset.y,
+          compareLayout.remoteRect.width,
+          compareLayout.remoteRect.height
+        )
+        const overlapRect = getOverlapRect(localBounds, remoteBounds)
+        if (!overlapRect) return
 
-      const crop = mapStageOverlapToLocalScreenPixels(
-        overlapRect,
-        localBounds,
-        compare.local.resolution
-      )
-      const fullFrame = captureFullScreenImage()
-      const imageDataUrl = fullFrame.imageDataUrl
-      if (!imageDataUrl) return
+        const fullFrame = await captureFullScreenImage()
+        const imageDataUrl = fullFrame.imageDataUrl
+        if (!imageDataUrl) return
 
-      void window.api.projectionPush(projectionSessionId, {
-        imageDataUrl,
-        overlap: {
-          width: fullFrame.width,
-          height: fullFrame.height,
-          left: 0,
-          top: 0
-        }
-      })
+        await window.api.projectionPush(projectionSessionId, {
+          imageDataUrl,
+          overlap: {
+            width: fullFrame.width,
+            height: fullFrame.height,
+            left: 0,
+            top: 0
+          }
+        })
+      })()
     }, 320)
 
     return () => {

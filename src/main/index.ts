@@ -257,6 +257,62 @@ function createLocalDeviceRecord(): DeviceRecord {
   }
 }
 
+async function capturePrimaryDisplayFrame(): Promise<{
+  ok: boolean
+  imageDataUrl: string
+  width: number
+  height: number
+  message: string
+}> {
+  try {
+    const display = screen.getPrimaryDisplay()
+    const scaleFactor = display.scaleFactor > 0 ? display.scaleFactor : 1
+    const captureWidth = Math.max(320, Math.round(display.size.width * scaleFactor))
+    const captureHeight = Math.max(200, Math.round(display.size.height * scaleFactor))
+
+    const sources = await desktopCapturer.getSources({
+      types: ['screen'],
+      thumbnailSize: {
+        width: captureWidth,
+        height: captureHeight
+      }
+    })
+
+    const primaryDisplayId = String(display.id)
+    const source =
+      sources.find((item) => item.display_id === primaryDisplayId) ||
+      sources.find((item) => Boolean(item.display_id)) ||
+      sources[0]
+
+    if (!source || source.thumbnail.isEmpty()) {
+      return {
+        ok: false,
+        imageDataUrl: '',
+        width: 0,
+        height: 0,
+        message: '主屏截图失败：未获取到可用屏幕源'
+      }
+    }
+
+    const size = source.thumbnail.getSize()
+    return {
+      ok: true,
+      imageDataUrl: source.thumbnail.toDataURL(),
+      width: size.width,
+      height: size.height,
+      message: 'ok'
+    }
+  } catch (error) {
+    return {
+      ok: false,
+      imageDataUrl: '',
+      width: 0,
+      height: 0,
+      message: `主屏截图异常: ${String(error)}`
+    }
+  }
+}
+
 function getLocalIPv4Addresses(): string[] {
   const localAddresses = new Set<string>()
   const interfaces = os.networkInterfaces()
@@ -1679,6 +1735,10 @@ app.whenReady().then(() => {
 
   ipcMain.handle('lan:get-pairing-info', () => {
     return getPairingInfo()
+  })
+
+  ipcMain.handle('lan:capture-primary-frame', async () => {
+    return capturePrimaryDisplayFrame()
   })
 
   ipcMain.handle('lan:adb-connect', async (_event, target: string) => {

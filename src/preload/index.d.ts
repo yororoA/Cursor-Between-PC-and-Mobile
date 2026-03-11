@@ -38,6 +38,14 @@ type PairingInfo = {
   urls: string[]
 }
 
+type CaptureFrameResult = {
+  ok: boolean
+  imageDataUrl: string
+  width: number
+  height: number
+  message: string
+}
+
 type AdbConnectResult = {
   ok: boolean
   target: string
@@ -90,6 +98,7 @@ type AppApi = {
   refreshDiscovery: () => Promise<boolean>
   getDiscoveryDebug: () => Promise<DiscoveryDebugInfo>
   getPairingInfo: () => Promise<PairingInfo>
+  capturePrimaryFrame: () => Promise<CaptureFrameResult>
   adbConnect: (target: string) => Promise<AdbConnectResult>
   projectionStart: (targetDeviceId: string) => Promise<ProjectionStartResult>
   projectionPush: (
