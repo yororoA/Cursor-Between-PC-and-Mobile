@@ -8,7 +8,7 @@ import {
   type Server,
   type ServerResponse
 } from 'http'
-import { existsSync } from 'fs'
+import { existsSync, readFileSync, unlinkSync } from 'fs'
 import os from 'os'
 import { randomUUID } from 'crypto'
 import { exec } from 'child_process'
@@ -264,6 +264,9 @@ async function capturePrimaryDisplayFrame(): Promise<{
   height: number
   message: string
 }> {
+  const windowsApiResult = await capturePrimaryDisplayFrameViaWindowsApi()
+  if (windowsApiResult?.ok) return windowsApiResult
+
   try {
     const display = screen.getPrimaryDisplay()
     const scaleFactor = display.scaleFactor > 0 ? display.scaleFactor : 1
@@ -309,6 +312,78 @@ async function capturePrimaryDisplayFrame(): Promise<{
       width: 0,
       height: 0,
       message: `主屏截图异常: ${String(error)}`
+    }
+  }
+}
+
+async function capturePrimaryDisplayFrameViaWindowsApi(): Promise<{
+  ok: boolean
+  imageDataUrl: string
+  width: number
+  height: number
+  message: string
+} | null> {
+  if (process.platform !== 'win32') return null
+
+  const tempPath = join(
+    os.tmpdir(),
+    `cursor-bridge-capture-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}.png`
+  )
+
+  const escapedTempPath = tempPath.replace(/'/g, "''")
+  const psScript = [
+    'Add-Type -AssemblyName System.Windows.Forms',
+    'Add-Type -AssemblyName System.Drawing',
+    '$bounds = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds',
+    '$bmp = New-Object System.Drawing.Bitmap $bounds.Width, $bounds.Height',
+    '$g = [System.Drawing.Graphics]::FromImage($bmp)',
+    '$g.CopyFromScreen($bounds.Location, [System.Drawing.Point]::Empty, $bounds.Size)',
+    `$bmp.Save('${escapedTempPath}', [System.Drawing.Imaging.ImageFormat]::Png)`,
+    '$g.Dispose()',
+    '$bmp.Dispose()',
+    'Write-Output ("{0},{1}" -f $bounds.Width, $bounds.Height)'
+  ].join('; ')
+
+  const command = `powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command "${psScript.replace(/"/g, '\\"')}"`
+  const result = await execPromise(command)
+
+  try {
+    if (!existsSync(tempPath)) {
+      return {
+        ok: false,
+        imageDataUrl: '',
+        width: 0,
+        height: 0,
+        message: result.stderr || 'Windows 截图 API 未生成图像文件'
+      }
+    }
+
+    const output = `${result.stdout}`.trim()
+    const [wRaw, hRaw] = output.split(',')
+    const width = Math.max(1, Number(wRaw) || 0)
+    const height = Math.max(1, Number(hRaw) || 0)
+    const imageDataUrl = `data:image/png;base64,${readFileSync(tempPath).toString('base64')}`
+
+    return {
+      ok: true,
+      imageDataUrl,
+      width,
+      height,
+      message: 'ok'
+    }
+  } catch (error) {
+    return {
+      ok: false,
+      imageDataUrl: '',
+      width: 0,
+      height: 0,
+      message: `Windows 截图 API 读取失败: ${String(error)}`
+    }
+  } finally {
+    try {
+      if (existsSync(tempPath)) unlinkSync(tempPath)
+    } catch {
+      // ignore cleanup error
     }
   }
 }
