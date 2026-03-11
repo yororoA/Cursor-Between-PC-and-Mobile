@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
+import QRCode from 'qrcode'
 
 type DeviceInfo = {
   id: string
@@ -36,6 +37,11 @@ type DiscoveryDebugInfo = {
   lastIncomingAt: number
   lastIncomingFrom: string
   lastError: string
+}
+
+type PairingInfo = {
+  port: number
+  urls: string[]
 }
 
 const LIST_HEIGHT = 420
@@ -89,6 +95,8 @@ function App(): React.JSX.Element {
   const [dragOffset, setDragOffset] = useState({ x: 260, y: 20 })
   const [refreshing, setRefreshing] = useState(false)
   const [debugInfo, setDebugInfo] = useState<DiscoveryDebugInfo | null>(null)
+  const [pairingInfo, setPairingInfo] = useState<PairingInfo | null>(null)
+  const [pairQrDataUrl, setPairQrDataUrl] = useState('')
   const dragStateRef = useRef<{ active: boolean; startX: number; startY: number; x: number; y: number }>({
     active: false,
     startX: 0,
@@ -124,12 +132,26 @@ function App(): React.JSX.Element {
         })
     }
 
+    const updatePairing = (): void => {
+      window.api
+        .getPairingInfo()
+        .then((info) => {
+          if (mounted) setPairingInfo(info)
+        })
+        .catch(() => {
+          if (mounted) setPairingInfo(null)
+        })
+    }
+
     updateDebug()
+    updatePairing()
     const timer = window.setInterval(updateDebug, 2000)
+    const pairingTimer = window.setInterval(updatePairing, 10000)
 
     return () => {
       mounted = false
       window.clearInterval(timer)
+      window.clearInterval(pairingTimer)
       dispose()
     }
   }, [])
@@ -188,6 +210,35 @@ function App(): React.JSX.Element {
 
     return ''
   }, [debugInfo, devices.length])
+
+  const primaryPairUrl = pairingInfo?.urls?.[0] || ''
+
+  useEffect(() => {
+    if (!primaryPairUrl) {
+      setPairQrDataUrl('')
+      return
+    }
+
+    let active = true
+    QRCode.toDataURL(primaryPairUrl, {
+      width: 220,
+      margin: 2,
+      color: {
+        dark: '#0b1420',
+        light: '#ffffff'
+      }
+    })
+      .then((url) => {
+        if (active) setPairQrDataUrl(url)
+      })
+      .catch(() => {
+        if (active) setPairQrDataUrl('')
+      })
+
+    return () => {
+      active = false
+    }
+  }, [primaryPairUrl])
 
   const totalCount = filteredDevices.length
   const startIndex = Math.max(0, Math.floor(scrollTop / ROW_HEIGHT) - OVERSCAN)
@@ -303,6 +354,27 @@ function App(): React.JSX.Element {
       </header>
 
       <section className="panel">
+        <section className="pair-panel">
+          <h2>手机接入</h2>
+          <p className="pair-line">手机浏览器打开以下地址之一，保持页面常亮即可自动出现在设备列表。</p>
+          <p className="pair-line">配对端口: {pairingInfo?.port ?? '--'}</p>
+          {primaryPairUrl && pairQrDataUrl ? (
+            <div className="pair-qr-wrap">
+              <img className="pair-qr" src={pairQrDataUrl} alt="手机接入二维码" />
+              <p className="pair-line">扫码优先地址: {primaryPairUrl}</p>
+            </div>
+          ) : null}
+          {pairingInfo?.urls?.length ? (
+            pairingInfo.urls.map((url) => (
+              <p key={url} className="pair-url">
+                {url}
+              </p>
+            ))
+          ) : (
+            <p className="pair-line">未获取到可用本机 IPv4 地址</p>
+          )}
+        </section>
+
         <div className="search-row">
           <input
             className="search-input"

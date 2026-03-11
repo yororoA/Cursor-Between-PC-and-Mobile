@@ -1,6 +1,7 @@
 import { app, shell, BrowserWindow, ipcMain, screen } from 'electron'
 import { join } from 'path'
 import { createSocket, type Socket } from 'dgram'
+import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'http'
 import os from 'os'
 import { randomUUID } from 'crypto'
 import { exec } from 'child_process'
@@ -40,6 +41,24 @@ type DiscoveryDebugSnapshot = {
   lastError: string
 }
 
+type PairingInfo = {
+  port: number
+  urls: string[]
+}
+
+type BrowserHelloPayload = {
+  clientId?: string
+  name?: string
+  width?: number
+  height?: number
+  dpr?: number
+  userAgent?: string
+}
+
+function isLikelyMobileUserAgent(userAgent: string): boolean {
+  return /android|iphone|ipad|ipod|mobile/i.test(userAgent)
+}
+
 type WireMessage =
   | {
       type: 'announce'
@@ -76,16 +95,19 @@ type WireMessage =
     }
 
 const DISCOVERY_PORT = 42425
+const WEB_PAIR_PORT = 42426
 const BROADCAST_ADDRESS = '255.255.255.255'
 const ANNOUNCE_INTERVAL_MS = 3_000
 const DISCOVERY_SWEEP_INTERVAL_MS = 12_000
 const PEER_TTL_MS = 10_000
+const WEB_PEER_PREFIX = 'web:'
 
 const localDeviceId = randomUUID()
 const localDeviceName = os.hostname()
 
 let mainWindowRef: BrowserWindow | null = null
 let discoverySocket: Socket | null = null
+let webPairServer: Server | null = null
 let announceTimer: NodeJS.Timeout | null = null
 let discoverySweepTimer: NodeJS.Timeout | null = null
 let pruneTimer: NodeJS.Timeout | null = null
@@ -131,7 +153,193 @@ function getDiscoveryDebugSnapshot(): DiscoveryDebugSnapshot {
   return {
     ...debugState,
     lastArpNeighbors: [...debugState.lastArpNeighbors],
-    broadcastAddresses: [...debugState.broadcastAddresses]
+    broadcastAddresses: [...debugState.broadcastAddresses],
+    localAddresses: [...debugState.localAddresses]
+  }
+}
+
+function normalizeRemoteAddress(address: string | undefined): string {
+  if (!address) return ''
+  if (address.startsWith('::ffff:')) return address.slice(7)
+  if (address === '::1') return '127.0.0.1'
+  return address
+}
+
+function getPairingInfo(): PairingInfo {
+  const localAddresses = getLocalIPv4Addresses().filter((ip) => !ip.startsWith('169.254.'))
+  const urls = localAddresses.map((ip) => `http://${ip}:${WEB_PAIR_PORT}/pair`)
+  return {
+    port: WEB_PAIR_PORT,
+    urls
+  }
+}
+
+function createPairPageHtml(): string {
+  return `<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Device Bridge Pair</title>
+  <style>
+    body { font-family: -apple-system, BlinkMacSystemFont, Segoe UI, Roboto, sans-serif; margin: 0; padding: 20px; background: #0f1720; color: #f3f6fa; }
+    .card { max-width: 560px; margin: 0 auto; border: 1px solid #2a3a4c; border-radius: 14px; padding: 16px; background: #152231; }
+    h1 { margin: 0 0 10px; font-size: 22px; }
+    p { margin: 8px 0; color: #d3deea; }
+    .ok { color: #7ce0ab; }
+    .meta { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12px; color: #9fc0dc; word-break: break-all; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1>Phone Connected</h1>
+    <p>Keep this page open. This phone will appear in the desktop app device list.</p>
+    <p id="status" class="ok">Connecting...</p>
+    <p id="meta" class="meta"></p>
+  </div>
+  <script>
+    const key = 'bridge-client-id';
+    let clientId = localStorage.getItem(key);
+    if (!clientId) {
+      clientId = (self.crypto && self.crypto.randomUUID) ? self.crypto.randomUUID() : String(Date.now()) + String(Math.random()).slice(2);
+      localStorage.setItem(key, clientId);
+    }
+
+    const statusEl = document.getElementById('status');
+    const metaEl = document.getElementById('meta');
+
+    async function ping() {
+      const payload = {
+        clientId,
+        name: navigator.userAgent.includes('iPhone') ? 'iPhone' : navigator.userAgent.includes('Android') ? 'Android Phone' : 'Mobile Browser',
+        width: window.screen.width,
+        height: window.screen.height,
+        dpr: window.devicePixelRatio || 1,
+        userAgent: navigator.userAgent
+      };
+
+      metaEl.textContent = JSON.stringify(payload);
+      try {
+        const response = await fetch('/api/hello', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload)
+        });
+        statusEl.textContent = response.ok ? 'Connected to desktop app' : 'Connection failed';
+      } catch (error) {
+        statusEl.textContent = 'Connection failed';
+      }
+    }
+
+    ping();
+    setInterval(ping, 3000);
+  </script>
+</body>
+</html>`
+}
+
+function writeJson(res: ServerResponse, statusCode: number, payload: unknown): void {
+  res.statusCode = statusCode
+  res.setHeader('Content-Type', 'application/json; charset=utf-8')
+  res.setHeader('Access-Control-Allow-Origin', '*')
+  res.end(JSON.stringify(payload))
+}
+
+function handlePairHello(req: IncomingMessage, res: ServerResponse): void {
+  let raw = ''
+  req.setEncoding('utf-8')
+
+  req.on('data', (chunk) => {
+    raw += chunk
+    if (raw.length > 12_000) {
+      raw = ''
+      writeJson(res, 413, { ok: false })
+      req.destroy()
+    }
+  })
+
+  req.on('end', () => {
+    try {
+      const parsed = JSON.parse(raw) as BrowserHelloPayload
+      const cssWidth = Math.max(1, Number(parsed.width) || 1)
+      const cssHeight = Math.max(1, Number(parsed.height) || 1)
+      const dpr = Math.max(0.75, Number(parsed.dpr) || 1)
+      const clientId = (parsed.clientId || randomUUID()).replace(/[^a-zA-Z0-9-_]/g, '')
+      const remoteAddress = normalizeRemoteAddress(req.socket.remoteAddress)
+      const userAgent = String(parsed.userAgent || '')
+      const mobileUA = isLikelyMobileUserAgent(userAgent)
+      const resolutionWidth = Math.round(cssWidth * dpr)
+      const resolutionHeight = Math.round(cssHeight * dpr)
+
+      // Web APIs expose CSS pixels, so convert with DPR and use a mobile-friendly baseline PPI.
+      const dpi = Math.round((mobileUA ? 160 : 96) * dpr)
+
+      const peer: DeviceRecord = {
+        id: `${WEB_PEER_PREFIX}${clientId}`,
+        name: parsed.name?.trim() || 'Mobile Browser',
+        address: remoteAddress,
+        resolution: {
+          width: resolutionWidth,
+          height: resolutionHeight
+        },
+        dpi,
+        lastSeen: Date.now()
+      }
+
+      mergePeer(peer)
+      writeJson(res, 200, { ok: true })
+    } catch {
+      writeJson(res, 400, { ok: false })
+    }
+  })
+}
+
+function startWebPairService(): void {
+  const server = createServer((req, res) => {
+    if (!req.url) {
+      res.statusCode = 404
+      res.end('Not Found')
+      return
+    }
+
+    if (req.method === 'OPTIONS') {
+      res.statusCode = 204
+      res.setHeader('Access-Control-Allow-Origin', '*')
+      res.setHeader('Access-Control-Allow-Methods', 'POST, GET, OPTIONS')
+      res.setHeader('Access-Control-Allow-Headers', 'Content-Type')
+      res.end()
+      return
+    }
+
+    if (req.method === 'GET' && req.url === '/pair') {
+      res.statusCode = 200
+      res.setHeader('Content-Type', 'text/html; charset=utf-8')
+      res.end(createPairPageHtml())
+      return
+    }
+
+    if (req.method === 'POST' && req.url === '/api/hello') {
+      handlePairHello(req, res)
+      return
+    }
+
+    res.statusCode = 404
+    res.end('Not Found')
+  })
+
+  server.on('error', (error) => {
+    debugState.lastError = String(error)
+    console.error('Pair service error:', error)
+  })
+
+  server.listen(WEB_PAIR_PORT)
+  webPairServer = server
+}
+
+function stopWebPairService(): void {
+  if (webPairServer) {
+    webPairServer.close()
+    webPairServer = null
   }
 }
 
@@ -447,6 +655,7 @@ function stopDiscoveryService(): void {
 async function requestPeerInfo(deviceId: string): Promise<DeviceRecord | null> {
   const known = peers.get(deviceId)
   if (!known) return null
+  if (deviceId.startsWith(WEB_PEER_PREFIX)) return known
 
   const requestId = randomUUID()
   const targetAddress = known.address || BROADCAST_ADDRESS
@@ -546,7 +755,12 @@ app.whenReady().then(() => {
     return getDiscoveryDebugSnapshot()
   })
 
+  ipcMain.handle('lan:get-pairing-info', () => {
+    return getPairingInfo()
+  })
+
   startDiscoveryService()
+  startWebPairService()
 
   createWindow()
 
@@ -568,6 +782,7 @@ app.on('window-all-closed', () => {
 
 app.on('before-quit', () => {
   stopDiscoveryService()
+  stopWebPairService()
 })
 
 // In this file you can include the rest of your app's specific main process

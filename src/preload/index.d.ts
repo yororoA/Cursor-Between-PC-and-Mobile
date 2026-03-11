@@ -33,12 +33,18 @@ type DiscoveryDebugInfo = {
   lastError: string
 }
 
+type PairingInfo = {
+  port: number
+  urls: string[]
+}
+
 type AppApi = {
   getDevices: () => Promise<DeviceInfo[]>
   getLocalDevice: () => Promise<DeviceInfo>
   requestDeviceInfo: (deviceId: string) => Promise<DeviceInfo | null>
   refreshDiscovery: () => Promise<boolean>
   getDiscoveryDebug: () => Promise<DiscoveryDebugInfo>
+  getPairingInfo: () => Promise<PairingInfo>
   onDevicesUpdated: (callback: (devices: DeviceInfo[]) => void) => () => void
 }
 
