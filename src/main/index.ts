@@ -646,6 +646,7 @@ function ensureReceiverWindow(): void {
   receiverWindow.on('ready-to-show', () => {
     receiverWindow.show()
     receiverWindow.setFullScreen(true)
+    receiverWindow.setContentProtection(true)
     receiverWindow.focus()
   })
   receiverWindow.on('closed', () => {
@@ -1131,7 +1132,7 @@ function startWebPairService(): void {
       return
     }
 
-    if (req.method === 'GET' && req.url === '/pair') {
+    if (req.method === 'GET' && req.url.startsWith('/pair')) {
       res.statusCode = 200
       res.setHeader('Content-Type', 'text/html; charset=utf-8')
       res.end(createPairPageHtml())
@@ -1741,6 +1742,7 @@ function createWindow(): void {
   mainWindowRef = mainWindow
   mainWindow.on('ready-to-show', () => {
     mainWindow.setFullScreen(true)
+    mainWindow.setContentProtection(true)
     mainWindow.show()
   })
   mainWindow.webContents.setWindowOpenHandler((details) => {

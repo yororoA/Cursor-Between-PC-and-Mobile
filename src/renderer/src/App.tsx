@@ -256,9 +256,11 @@ function App(): React.JSX.Element {
   const [projectionSessionId, setProjectionSessionId] = useState('')
   const [projectionStatus, setProjectionStatus] = useState<ProjectionStatus | null>(null)
   const [projectionStatusText, setProjectionStatusText] = useState('未建立投映会话')
+  const [sendPreviewDataUrl, setSendPreviewDataUrl] = useState('')
   const [snapGuides, setSnapGuides] = useState<{ x: number | null; y: number | null }>({ x: null, y: null })
   const [stageSize, setStageSize] = useState({ width: 900, height: 540 })
   const [screenCaptureReady, setScreenCaptureReady] = useState(false)
+  const lastPreviewUpdateAtRef = useRef(0)
   const stageRef = useRef<HTMLElement | null>(null)
   const dragStateRef = useRef<{ active: boolean; startX: number; startY: number; x: number; y: number }>({
     active: false,
@@ -334,6 +336,7 @@ function App(): React.JSX.Element {
       document.body.classList.remove('overlay-mode')
       void window.api.setOverlayMode(false)
       void window.api.setClickThrough(false)
+      setSendPreviewDataUrl('')
       return
     }
 
@@ -345,6 +348,7 @@ function App(): React.JSX.Element {
       document.body.classList.remove('overlay-mode')
       void window.api.setOverlayMode(false)
       void window.api.setClickThrough(false)
+      setSendPreviewDataUrl('')
     }
   }, [compare])
 
@@ -654,6 +658,7 @@ function App(): React.JSX.Element {
     setProjectionSessionId('')
     setProjectionStatus(null)
     setProjectionStatusText('未建立投映会话')
+    setSendPreviewDataUrl('')
   }
 
   useEffect(() => {
@@ -679,6 +684,12 @@ function App(): React.JSX.Element {
         const fullFrame = await captureFullScreenImage()
         const imageDataUrl = fullFrame.imageDataUrl
         if (!imageDataUrl) return
+
+        const now = Date.now()
+        if (now - lastPreviewUpdateAtRef.current >= 500) {
+          lastPreviewUpdateAtRef.current = now
+          setSendPreviewDataUrl(imageDataUrl)
+        }
 
         await window.api.projectionPush(projectionSessionId, {
           imageDataUrl,
@@ -774,6 +785,15 @@ function App(): React.JSX.Element {
         <p className="snapshot-line">
           整屏采集: {screenCaptureReady ? '已就绪' : '未就绪（确认连接时会请求权限）'}
         </p>
+
+        <aside className="send-preview-panel">
+          <p className="send-preview-title">发送预览</p>
+          {sendPreviewDataUrl ? (
+            <img className="send-preview-image" src={sendPreviewDataUrl} alt="发送中的图像预览" />
+          ) : (
+            <p className="send-preview-empty">等待首帧...</p>
+          )}
+        </aside>
 
         <section className="stage" ref={stageRef}>
           <div className="ruler ruler-x">
