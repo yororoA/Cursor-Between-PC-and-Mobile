@@ -205,7 +205,7 @@ function App(): React.JSX.Element {
     updateDebug()
     updatePairing()
     const timer = window.setInterval(updateDebug, 2000)
-    const pairingTimer = window.setInterval(updatePairing, 10000)
+    const pairingTimer = window.setInterval(updatePairing, 10_000)
 
     return () => {
       mounted = false
@@ -293,19 +293,16 @@ function App(): React.JSX.Element {
 
   const diagnosis = useMemo(() => {
     if (!debugInfo) return ''
-    const hasAnyInbound = debugInfo.lastIncomingAt > 0
-    const selfLoopOnly =
-      hasAnyInbound &&
-      !!debugInfo.lastIncomingFrom &&
-      debugInfo.localAddresses.includes(debugInfo.lastIncomingFrom) &&
-      devices.length === 0
-
-    if (selfLoopOnly) {
-      return '当前主要收到本机回环报文。请在两台设备都放行 UDP 42425 入站(公用网络/专用网络)，并关闭热点的设备隔离。'
+    if (!debugInfo.lastSweepAt) {
+      return '正在等待首次设备扫描结果（ADB / UDP）。'
     }
 
-    if (debugInfo.lastArpNeighborCount > 0 && debugInfo.announceReceivedCount === 0 && devices.length === 0) {
-      return 'ARP 已发现邻居，但未收到任何对端广播。通常是防火墙或对端应用未启动。'
+    if (debugInfo.lastError) {
+      return 'ADB 不可用。请确认已安装 Android Platform Tools；同时可继续使用 UDP 局域网发现。'
+    }
+
+    if (devices.length === 0) {
+      return '未检测到设备。可尝试 USB 调试（ADB）或保持局域网 UDP 自动发现。'
     }
 
     return ''
@@ -490,15 +487,15 @@ function App(): React.JSX.Element {
     <main className="app-shell">
       <header className="topbar">
         <div>
-          <h1>LAN Device Bridge</h1>
-          <p>应用启动后自动扫描同一局域网设备</p>
+          <h1>Device Bridge (ADB + UDP)</h1>
+          <p>应用会同时进行 ADB 与局域网 UDP 设备发现</p>
         </div>
       </header>
 
       <section className="panel">
         <section className="pair-panel">
-          <h2>手机接入</h2>
-          <p className="pair-line">手机浏览器打开以下地址之一，保持页面常亮即可自动出现在设备列表。</p>
+          <h2>手机接入（ADB / UDP）</h2>
+          <p className="pair-line">也可使用 HTTP 配对：手机浏览器打开下列地址，或扫描二维码。</p>
           <p className="pair-line">配对端口: {pairingInfo?.port ?? '--'}</p>
           {primaryPairUrl && pairQrDataUrl ? (
             <div className="pair-qr-wrap">
@@ -506,15 +503,16 @@ function App(): React.JSX.Element {
               <p className="pair-line">扫码优先地址: {primaryPairUrl}</p>
             </div>
           ) : null}
-          {pairingInfo?.urls?.length ? (
-            pairingInfo.urls.map((url) => (
-              <p key={url} className="pair-url">
-                {url}
-              </p>
-            ))
-          ) : (
-            <p className="pair-line">未获取到可用本机 IPv4 地址</p>
-          )}
+          {pairingInfo?.urls?.length
+            ? pairingInfo.urls.map((url) => (
+                <p key={url} className="pair-url">
+                  {url}
+                </p>
+              ))
+            : null}
+          <p className="pair-line">1) 手机开启开发者选项与 USB 调试。</p>
+          <p className="pair-line">2) USB 连接后，在手机上点击“允许 USB 调试”。</p>
+          <p className="pair-line">3) 如需无线调试，请先 USB 配对后执行 adb tcpip / adb connect。</p>
         </section>
 
         <div className="search-row">
@@ -522,7 +520,7 @@ function App(): React.JSX.Element {
             className="search-input"
             value={query}
             onChange={(event) => setQuery(event.target.value)}
-            placeholder="搜索设备名称、IP 或分辨率"
+            placeholder="搜索设备名称、序列号或分辨率"
           />
           <button
             type="button"
@@ -569,33 +567,23 @@ function App(): React.JSX.Element {
           <div style={{ height: bottomSpacerHeight }} />
         </div>
 
-        {totalCount === 0 ? <p className="empty">当前没有可用设备，请确认其他设备已启动应用且处于同一局域网。</p> : null}
+        {totalCount === 0 ? <p className="empty">当前没有可用设备，请确认 adb 授权或局域网 UDP 可互通。</p> : null}
         {error ? <p className="error">{error}</p> : null}
 
         <section className="debug-panel">
-          <h2>发现调试</h2>
+          <h2>ADB 调试</h2>
           {!debugInfo ? (
             <p className="debug-line">调试信息暂不可用</p>
           ) : (
             <>
               <p className="debug-line">启动时间: {toTimeLabel(debugInfo.startedAt)}</p>
-              <p className="debug-line">最近 announce: {toTimeLabel(debugInfo.lastAnnounceAt)}</p>
-              <p className="debug-line">最近 sweep: {toTimeLabel(debugInfo.lastSweepAt)}</p>
-              <p className="debug-line">最近 ARP 读取: {toTimeLabel(debugInfo.lastArpReadAt)}</p>
-              <p className="debug-line">ARP 邻居数: {debugInfo.lastArpNeighborCount}</p>
-              <p className="debug-line">广播地址: {debugInfo.broadcastAddresses.join(', ') || '--'}</p>
-              <p className="debug-line">本机地址: {debugInfo.localAddresses.join(', ') || '--'}</p>
-              <p className="debug-line">最近入站来源: {debugInfo.lastIncomingFrom || '--'}</p>
-              <p className="debug-line">最近入站时间: {toTimeLabel(debugInfo.lastIncomingAt)}</p>
+              <p className="debug-line">最近扫描: {toTimeLabel(debugInfo.lastSweepAt)}</p>
+              <p className="debug-line">最近 adb 读取: {toTimeLabel(debugInfo.lastArpReadAt)}</p>
+              <p className="debug-line">连接设备数: {debugInfo.lastArpNeighborCount}</p>
+              <p className="debug-line">设备序列号: {debugInfo.lastArpNeighbors.join(', ') || '--'}</p>
               <p className="debug-line">
-                发送计数: announce {debugInfo.announceSentCount}, discover-request {debugInfo.discoverRequestSentCount},
-                discover-response {debugInfo.discoverResponseSentCount}
+                扫描计数: {debugInfo.discoverRequestSentCount} / 响应计数: {debugInfo.discoverResponseReceivedCount}
               </p>
-              <p className="debug-line">
-                接收计数: announce {debugInfo.announceReceivedCount}, discover-request {debugInfo.discoverRequestReceivedCount},
-                discover-response {debugInfo.discoverResponseReceivedCount}, info-response {debugInfo.infoResponseReceivedCount}
-              </p>
-              <p className="debug-line">ARP 邻居样本: {debugInfo.lastArpNeighbors.join(', ') || '--'}</p>
               {diagnosis ? <p className="debug-error">诊断: {diagnosis}</p> : null}
               {debugInfo.lastError ? <p className="debug-error">最近错误: {debugInfo.lastError}</p> : null}
             </>

@@ -2,6 +2,7 @@ import { app, shell, BrowserWindow, ipcMain, screen } from 'electron'
 import { join } from 'path'
 import { createSocket, type Socket } from 'dgram'
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'http'
+import { existsSync } from 'fs'
 import os from 'os'
 import { randomUUID } from 'crypto'
 import { exec } from 'child_process'
@@ -55,52 +56,25 @@ type BrowserHelloPayload = {
   userAgent?: string
 }
 
-function isLikelyMobileUserAgent(userAgent: string): boolean {
-  return /android|iphone|ipad|ipod|mobile/i.test(userAgent)
-}
-
 type WireMessage =
-  | {
-      type: 'announce'
-      payload: DeviceRecord
-    }
-  | {
-      type: 'query-info'
-      payload: {
-        requesterId: string
-        targetId: string
-        requestId: string
-      }
-    }
+  | { type: 'announce'; payload: DeviceRecord }
+  | { type: 'query-info'; payload: { requesterId: string; targetId: string; requestId: string } }
   | {
       type: 'info-response'
-      payload: {
-        requestId: string
-        targetId: string
-        device: DeviceRecord
-      }
+      payload: { requestId: string; targetId: string; device: DeviceRecord }
     }
-  | {
-      type: 'discover-request'
-      payload: {
-        requestId: string
-      }
-    }
-  | {
-      type: 'discover-response'
-      payload: {
-        requestId: string
-        device: DeviceRecord
-      }
-    }
+  | { type: 'discover-request'; payload: { requestId: string } }
+  | { type: 'discover-response'; payload: { requestId: string; device: DeviceRecord } }
 
 const DISCOVERY_PORT = 42425
 const WEB_PAIR_PORT = 42426
 const BROADCAST_ADDRESS = '255.255.255.255'
+const ADB_SCAN_INTERVAL_MS = 3_000
 const ANNOUNCE_INTERVAL_MS = 3_000
 const DISCOVERY_SWEEP_INTERVAL_MS = 12_000
 const PEER_TTL_MS = 10_000
 const WEB_PEER_PREFIX = 'web:'
+const WEB_PEER_TTL_MS = 20_000
 
 const localDeviceId = randomUUID()
 const localDeviceName = os.hostname()
@@ -108,12 +82,16 @@ const localDeviceName = os.hostname()
 let mainWindowRef: BrowserWindow | null = null
 let discoverySocket: Socket | null = null
 let webPairServer: Server | null = null
+let adbScanTimer: NodeJS.Timeout | null = null
 let announceTimer: NodeJS.Timeout | null = null
 let discoverySweepTimer: NodeJS.Timeout | null = null
 let pruneTimer: NodeJS.Timeout | null = null
 
-const peers = new Map<string, DeviceRecord>()
+const udpPeers = new Map<string, DeviceRecord>()
+const adbPeers = new Map<string, DeviceRecord>()
+const webPeers = new Map<string, DeviceRecord>()
 const pendingRequests = new Map<string, (device: DeviceRecord) => void>()
+
 const debugState: DiscoveryDebugSnapshot = {
   startedAt: Date.now(),
   lastAnnounceAt: 0,
@@ -135,18 +113,18 @@ const debugState: DiscoveryDebugSnapshot = {
   lastError: ''
 }
 
-function getLocalIPv4Addresses(): string[] {
-  const localAddresses = new Set<string>()
-  const interfaces = os.networkInterfaces()
-  for (const entries of Object.values(interfaces)) {
-    if (!entries) continue
-    for (const item of entries) {
-      if (item.family === 'IPv4' && item.address) {
-        localAddresses.add(item.address)
-      }
-    }
+function getAllPeers(): DeviceRecord[] {
+  const merged = new Map<string, DeviceRecord>()
+  for (const [id, item] of udpPeers.entries()) merged.set(id, item)
+  for (const [id, item] of adbPeers.entries()) merged.set(id, item)
+  for (const [id, item] of webPeers.entries()) merged.set(id, item)
+  return Array.from(merged.values())
+}
+
+function emitDevicesUpdated(): void {
+  if (mainWindowRef && !mainWindowRef.isDestroyed()) {
+    mainWindowRef.webContents.send('lan:devices-updated', getAllPeers())
   }
-  return Array.from(localAddresses)
 }
 
 function getDiscoveryDebugSnapshot(): DiscoveryDebugSnapshot {
@@ -158,6 +136,51 @@ function getDiscoveryDebugSnapshot(): DiscoveryDebugSnapshot {
   }
 }
 
+function createLocalDeviceRecord(): DeviceRecord {
+  const display = screen.getPrimaryDisplay()
+  const bounds = display.size
+  const dpi = Math.max(72, Math.round(96 * (display.scaleFactor || 1)))
+  return {
+    id: localDeviceId,
+    name: localDeviceName,
+    address: '',
+    resolution: { width: bounds.width, height: bounds.height },
+    dpi,
+    lastSeen: Date.now()
+  }
+}
+
+function getLocalIPv4Addresses(): string[] {
+  const localAddresses = new Set<string>()
+  const interfaces = os.networkInterfaces()
+  for (const entries of Object.values(interfaces)) {
+    if (!entries) continue
+    for (const item of entries) {
+      if (item.family === 'IPv4' && item.address) localAddresses.add(item.address)
+    }
+  }
+  return Array.from(localAddresses)
+}
+
+function getBroadcastAddressesFromInterfaces(): string[] {
+  const networks = os.networkInterfaces()
+  const addresses = new Set<string>([BROADCAST_ADDRESS])
+  for (const entries of Object.values(networks)) {
+    if (!entries) continue
+    for (const item of entries) {
+      if (item.family !== 'IPv4' || item.internal || !item.address || !item.netmask) continue
+      const ipParts = item.address.split('.').map((part) => Number(part))
+      const maskParts = item.netmask.split('.').map((part) => Number(part))
+      if (ipParts.length !== 4 || maskParts.length !== 4) continue
+      const broadcast = ipParts.map(
+        (value, index) => (value & maskParts[index]) | (255 ^ maskParts[index])
+      )
+      addresses.add(broadcast.join('.'))
+    }
+  }
+  return Array.from(addresses)
+}
+
 function normalizeRemoteAddress(address: string | undefined): string {
   if (!address) return ''
   if (address.startsWith('::ffff:')) return address.slice(7)
@@ -167,10 +190,9 @@ function normalizeRemoteAddress(address: string | undefined): string {
 
 function getPairingInfo(): PairingInfo {
   const localAddresses = getLocalIPv4Addresses().filter((ip) => !ip.startsWith('169.254.'))
-  const urls = localAddresses.map((ip) => `http://${ip}:${WEB_PAIR_PORT}/pair`)
   return {
     port: WEB_PAIR_PORT,
-    urls
+    urls: localAddresses.map((ip) => `http://${ip}:${WEB_PAIR_PORT}/pair`)
   }
 }
 
@@ -245,6 +267,15 @@ function writeJson(res: ServerResponse, statusCode: number, payload: unknown): v
   res.end(JSON.stringify(payload))
 }
 
+function mergeWebPeer(nextPeer: DeviceRecord): void {
+  if (!nextPeer.id) return
+  webPeers.set(nextPeer.id, {
+    ...nextPeer,
+    lastSeen: Date.now()
+  })
+  emitDevicesUpdated()
+}
+
 function handlePairHello(req: IncomingMessage, res: ServerResponse): void {
   let raw = ''
   req.setEncoding('utf-8')
@@ -266,27 +297,19 @@ function handlePairHello(req: IncomingMessage, res: ServerResponse): void {
       const dpr = Math.max(0.75, Number(parsed.dpr) || 1)
       const clientId = (parsed.clientId || randomUUID()).replace(/[^a-zA-Z0-9-_]/g, '')
       const remoteAddress = normalizeRemoteAddress(req.socket.remoteAddress)
-      const userAgent = String(parsed.userAgent || '')
-      const mobileUA = isLikelyMobileUserAgent(userAgent)
-      const resolutionWidth = Math.round(cssWidth * dpr)
-      const resolutionHeight = Math.round(cssHeight * dpr)
 
-      // Web APIs expose CSS pixels, so convert with DPR and use a mobile-friendly baseline PPI.
-      const dpi = Math.round((mobileUA ? 160 : 96) * dpr)
-
-      const peer: DeviceRecord = {
+      mergeWebPeer({
         id: `${WEB_PEER_PREFIX}${clientId}`,
         name: parsed.name?.trim() || 'Mobile Browser',
         address: remoteAddress,
         resolution: {
-          width: resolutionWidth,
-          height: resolutionHeight
+          width: Math.round(cssWidth * dpr),
+          height: Math.round(cssHeight * dpr)
         },
-        dpi,
+        dpi: Math.round(160 * dpr),
         lastSeen: Date.now()
-      }
+      })
 
-      mergePeer(peer)
       writeJson(res, 200, { ok: true })
     } catch {
       writeJson(res, 400, { ok: false })
@@ -329,7 +352,6 @@ function startWebPairService(): void {
 
   server.on('error', (error) => {
     debugState.lastError = String(error)
-    console.error('Pair service error:', error)
   })
 
   server.listen(WEB_PAIR_PORT)
@@ -343,37 +365,152 @@ function stopWebPairService(): void {
   }
 }
 
-function createLocalDeviceRecord(): DeviceRecord {
-  const display = screen.getPrimaryDisplay()
-  const bounds = display.size
-  const dpi = Math.max(72, Math.round(96 * (display.scaleFactor || 1)))
+function execPromise(command: string): Promise<{ ok: boolean; stdout: string; stderr: string }> {
+  return new Promise((resolve) => {
+    exec(command, { windowsHide: true }, (error, stdout, stderr) => {
+      resolve({ ok: !error, stdout: stdout ?? '', stderr: stderr ?? '' })
+    })
+  })
+}
+
+function getAdbCandidates(): string[] {
+  const candidates = ['adb']
+  const resourceCandidates = [
+    join(process.cwd(), 'resources', 'Android-platform-tools', 'adb.exe'),
+    join(process.cwd(), 'resources', 'Android-platform-tools', 'platform-tools', 'adb.exe'),
+    join(app.getAppPath(), 'resources', 'Android-platform-tools', 'adb.exe'),
+    join(app.getAppPath(), 'resources', 'Android-platform-tools', 'platform-tools', 'adb.exe'),
+    join(process.resourcesPath, 'Android-platform-tools', 'adb.exe'),
+    join(process.resourcesPath, 'Android-platform-tools', 'platform-tools', 'adb.exe')
+  ].filter((item) => existsSync(item))
+
+  const windowsCandidates = [
+    process.env.ANDROID_HOME ? `${process.env.ANDROID_HOME}\\platform-tools\\adb.exe` : '',
+    process.env.ANDROID_SDK_ROOT ? `${process.env.ANDROID_SDK_ROOT}\\platform-tools\\adb.exe` : '',
+    process.env.LOCALAPPDATA
+      ? `${process.env.LOCALAPPDATA}\\Android\\Sdk\\platform-tools\\adb.exe`
+      : ''
+  ].filter(Boolean)
+
+  return process.platform === 'win32'
+    ? [...new Set([...candidates, ...resourceCandidates, ...windowsCandidates])]
+    : [...new Set([...candidates, ...resourceCandidates])]
+}
+
+async function resolveAdbCommand(): Promise<string | null> {
+  for (const candidate of getAdbCandidates()) {
+    const probe = await execPromise(`"${candidate}" version`)
+    if (probe.ok) return candidate
+  }
+  return null
+}
+
+function parseAdbSerials(output: string): string[] {
+  const serials: string[] = []
+  const lines = output
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean)
+  for (const line of lines) {
+    if (line.startsWith('List of devices attached')) continue
+    if (line.includes('unauthorized') || line.includes('offline')) continue
+    if (!line.includes('device')) continue
+    const serial = line.split(/\s+/)[0]
+    if (serial) serials.push(serial)
+  }
+  return serials
+}
+
+function parseResolution(raw: string): { width: number; height: number } {
+  const match = raw.match(/(\d+)x(\d+)/)
+  if (!match) return { width: 1080, height: 1920 }
+  return { width: Number(match[1] || 1080), height: Number(match[2] || 1920) }
+}
+
+function parseDpi(raw: string): number {
+  const match = raw.match(/(\d{2,4})/)
+  if (!match) return 420
+  return Number(match[1] || 420)
+}
+
+async function readAdbDevice(adb: string, serial: string): Promise<DeviceRecord> {
+  const [model, size, density] = await Promise.all([
+    execPromise(`"${adb}" -s "${serial}" shell getprop ro.product.model`),
+    execPromise(`"${adb}" -s "${serial}" shell wm size`),
+    execPromise(`"${adb}" -s "${serial}" shell wm density`)
+  ])
+
+  const resolution = parseResolution(size.stdout)
+  const dpi = parseDpi(density.stdout)
 
   return {
-    id: localDeviceId,
-    name: localDeviceName,
-    address: '',
-    resolution: {
-      width: bounds.width,
-      height: bounds.height
-    },
+    id: serial,
+    name: model.stdout.trim() || `Android (${serial})`,
+    address: `adb:${serial}`,
+    resolution,
     dpi,
     lastSeen: Date.now()
   }
 }
 
-function emitDevicesUpdated(): void {
-  if (mainWindowRef && !mainWindowRef.isDestroyed()) {
-    mainWindowRef.webContents.send('lan:devices-updated', Array.from(peers.values()))
+async function refreshAdbDevices(): Promise<void> {
+  debugState.lastSweepAt = Date.now()
+  debugState.discoverRequestSentCount += 1
+
+  const adb = await resolveAdbCommand()
+  if (!adb) {
+    adbPeers.clear()
+    debugState.lastError = 'adb not found in PATH or Android SDK platform-tools'
+    emitDevicesUpdated()
+    return
   }
+
+  const result = await execPromise(`"${adb}" devices -l`)
+  debugState.lastArpReadAt = Date.now()
+  debugState.lastError = result.ok ? '' : result.stderr || 'adb devices failed'
+
+  const serials = parseAdbSerials(result.stdout)
+  debugState.lastArpNeighborCount = serials.length
+  debugState.lastArpNeighbors = serials
+  if (serials.length > 0) {
+    debugState.lastIncomingAt = Date.now()
+    debugState.lastIncomingFrom = serials[0]
+    debugState.discoverResponseReceivedCount += 1
+  }
+
+  const nextMap = new Map<string, DeviceRecord>()
+  const deviceResults = await Promise.all(serials.map((serial) => readAdbDevice(adb, serial)))
+  for (const item of deviceResults) nextMap.set(item.id, item)
+
+  let changed = adbPeers.size !== nextMap.size
+  if (!changed) {
+    for (const [id, value] of nextMap.entries()) {
+      const current = adbPeers.get(id)
+      if (!current) {
+        changed = true
+        break
+      }
+      if (
+        current.name !== value.name ||
+        current.address !== value.address ||
+        current.dpi !== value.dpi ||
+        current.resolution.width !== value.resolution.width ||
+        current.resolution.height !== value.resolution.height
+      ) {
+        changed = true
+        break
+      }
+    }
+  }
+
+  adbPeers.clear()
+  for (const [id, value] of nextMap.entries()) adbPeers.set(id, value)
+  if (changed) emitDevicesUpdated()
 }
 
-function mergePeer(nextPeer: DeviceRecord): void {
+function mergeUdpPeer(nextPeer: DeviceRecord): void {
   if (!nextPeer.id || nextPeer.id === localDeviceId) return
-
-  peers.set(nextPeer.id, {
-    ...nextPeer,
-    lastSeen: Date.now()
-  })
+  udpPeers.set(nextPeer.id, { ...nextPeer, lastSeen: Date.now() })
   emitDevicesUpdated()
 }
 
@@ -381,160 +518,69 @@ function sendWireMessage(message: WireMessage, address = BROADCAST_ADDRESS): voi
   if (!discoverySocket) return
   const content = Buffer.from(JSON.stringify(message), 'utf-8')
   discoverySocket.send(content, DISCOVERY_PORT, address)
-
-  if (message.type === 'announce') {
-    debugState.announceSentCount += 1
-  } else if (message.type === 'discover-request') {
-    debugState.discoverRequestSentCount += 1
-  } else if (message.type === 'discover-response') {
-    debugState.discoverResponseSentCount += 1
-  }
-}
-
-function getBroadcastAddressesFromInterfaces(): string[] {
-  const networks = os.networkInterfaces()
-  const addresses = new Set<string>()
-
-  for (const entries of Object.values(networks)) {
-    if (!entries) continue
-
-    for (const item of entries) {
-      if (item.family !== 'IPv4' || item.internal || !item.address || !item.netmask) continue
-      const ipParts = item.address.split('.').map((part) => Number(part))
-      const maskParts = item.netmask.split('.').map((part) => Number(part))
-      if (ipParts.length !== 4 || maskParts.length !== 4) continue
-
-      const broadcast = ipParts.map((value, index) => (value & maskParts[index]) | (255 ^ maskParts[index]))
-      addresses.add(broadcast.join('.'))
-    }
-  }
-
-  addresses.add(BROADCAST_ADDRESS)
-  return Array.from(addresses)
-}
-
-function execPromise(command: string): Promise<string> {
-  return new Promise((resolve) => {
-    exec(command, { windowsHide: true }, (error, stdout) => {
-      if (error) {
-        resolve('')
-        return
-      }
-      resolve(stdout ?? '')
-    })
-  })
-}
-
-async function getArpNeighborAddresses(): Promise<string[]> {
-  const output =
-    process.platform === 'win32'
-      ? await execPromise('arp -a')
-      : process.platform === 'darwin'
-        ? await execPromise('arp -an')
-        : await execPromise('ip neigh')
-
-  if (!output) return []
-
-  const ipRegex = /\b(\d{1,3}(?:\.\d{1,3}){3})\b/g
-  const localIps = new Set<string>()
-  const neighbors = new Set<string>()
-  const interfaces = os.networkInterfaces()
-
-  for (const entries of Object.values(interfaces)) {
-    if (!entries) continue
-    for (const item of entries) {
-      if (item.family === 'IPv4' && item.address) {
-        localIps.add(item.address)
-      }
-    }
-  }
-
-  for (const match of output.matchAll(ipRegex)) {
-    const ip = match[1]
-    if (!ip) continue
-    const firstOctet = Number(ip.split('.')[0])
-    if (firstOctet >= 224 || firstOctet === 0 || firstOctet === 127) continue
-    if (ip === '255.255.255.255' || ip.endsWith('.255')) continue
-    if (localIps.has(ip)) continue
-    neighbors.add(ip)
-  }
-
-  return Array.from(neighbors)
-}
-
-async function triggerActiveDiscovery(): Promise<void> {
-  if (!discoverySocket) return
-  debugState.lastSweepAt = Date.now()
-  debugState.localAddresses = getLocalIPv4Addresses()
-
-  const requestId = randomUUID()
-  const probe: WireMessage = {
-    type: 'discover-request',
-    payload: {
-      requestId
-    }
-  }
-
-  const broadcastAddresses = getBroadcastAddressesFromInterfaces()
-  debugState.broadcastAddresses = broadcastAddresses
-
-  for (const address of broadcastAddresses) {
-    sendWireMessage(probe, address)
-  }
-
-  const arpNeighbors = await getArpNeighborAddresses()
-  debugState.lastArpReadAt = Date.now()
-  debugState.lastArpNeighborCount = arpNeighbors.length
-  debugState.lastArpNeighbors = arpNeighbors.slice(0, 60)
-  for (const address of arpNeighbors) {
-    sendWireMessage(probe, address)
-  }
+  if (message.type === 'announce') debugState.announceSentCount += 1
+  if (message.type === 'discover-request') debugState.discoverRequestSentCount += 1
+  if (message.type === 'discover-response') debugState.discoverResponseSentCount += 1
 }
 
 function announceSelf(): void {
   debugState.lastAnnounceAt = Date.now()
   debugState.localAddresses = getLocalIPv4Addresses()
-  const announceMessage: WireMessage = {
-    type: 'announce',
-    payload: createLocalDeviceRecord()
-  }
-
-  // Use subnet broadcast addresses to improve discovery on mobile hotspot networks.
+  const announceMessage: WireMessage = { type: 'announce', payload: createLocalDeviceRecord() }
   const broadcastAddresses = getBroadcastAddressesFromInterfaces()
   debugState.broadcastAddresses = broadcastAddresses
-  for (const address of broadcastAddresses) {
-    sendWireMessage(announceMessage, address)
-  }
+  for (const address of broadcastAddresses) sendWireMessage(announceMessage, address)
 }
 
-function handleWireMessage(raw: Buffer, remoteAddress: string): void {
-  let parsed: WireMessage | null = null
+async function triggerActiveDiscovery(): Promise<void> {
+  if (!discoverySocket) return
+  debugState.lastSweepAt = Date.now()
+  const requestId = randomUUID()
+  const probe: WireMessage = { type: 'discover-request', payload: { requestId } }
+  const broadcastAddresses = getBroadcastAddressesFromInterfaces()
+  debugState.broadcastAddresses = broadcastAddresses
+  for (const address of broadcastAddresses) sendWireMessage(probe, address)
+}
 
+function handleWireMessage(raw: Buffer, remoteAddressRaw: string): void {
+  let parsed: WireMessage | null = null
   try {
     parsed = JSON.parse(raw.toString('utf-8')) as WireMessage
   } catch {
     return
   }
-
   if (!parsed) return
 
+  const remoteAddress = normalizeRemoteAddress(remoteAddressRaw)
   debugState.lastIncomingAt = Date.now()
   debugState.lastIncomingFrom = remoteAddress
 
   if (parsed.type === 'announce') {
     debugState.announceReceivedCount += 1
-    const peer = {
-      ...parsed.payload,
-      address: remoteAddress,
-      lastSeen: Date.now()
-    }
-    mergePeer(peer)
+    mergeUdpPeer({ ...parsed.payload, address: remoteAddress, lastSeen: Date.now() })
+    return
+  }
+
+  if (parsed.type === 'discover-request') {
+    debugState.discoverRequestReceivedCount += 1
+    sendWireMessage(
+      {
+        type: 'discover-response',
+        payload: { requestId: parsed.payload.requestId, device: createLocalDeviceRecord() }
+      },
+      remoteAddress
+    )
+    return
+  }
+
+  if (parsed.type === 'discover-response') {
+    debugState.discoverResponseReceivedCount += 1
+    mergeUdpPeer({ ...parsed.payload.device, address: remoteAddress, lastSeen: Date.now() })
     return
   }
 
   if (parsed.type === 'query-info') {
     if (parsed.payload.targetId !== localDeviceId) return
-
     sendWireMessage(
       {
         type: 'info-response',
@@ -549,43 +595,11 @@ function handleWireMessage(raw: Buffer, remoteAddress: string): void {
     return
   }
 
-  if (parsed.type === 'discover-request') {
-    debugState.discoverRequestReceivedCount += 1
-    sendWireMessage(
-      {
-        type: 'discover-response',
-        payload: {
-          requestId: parsed.payload.requestId,
-          device: createLocalDeviceRecord()
-        }
-      },
-      remoteAddress
-    )
-    return
-  }
-
-  if (parsed.type === 'discover-response') {
-    debugState.discoverResponseReceivedCount += 1
-    const remoteDevice = {
-      ...parsed.payload.device,
-      address: remoteAddress,
-      lastSeen: Date.now()
-    }
-    mergePeer(remoteDevice)
-    return
-  }
-
   if (parsed.type === 'info-response') {
     if (parsed.payload.targetId !== localDeviceId) return
     debugState.infoResponseReceivedCount += 1
-
-    const remoteDevice = {
-      ...parsed.payload.device,
-      address: remoteAddress,
-      lastSeen: Date.now()
-    }
-    mergePeer(remoteDevice)
-
+    const remoteDevice = { ...parsed.payload.device, address: remoteAddress, lastSeen: Date.now() }
+    mergeUdpPeer(remoteDevice)
     const resolve = pendingRequests.get(parsed.payload.requestId)
     if (resolve) {
       pendingRequests.delete(parsed.payload.requestId)
@@ -594,36 +608,39 @@ function handleWireMessage(raw: Buffer, remoteAddress: string): void {
   }
 }
 
-function prunePeers(): void {
+function pruneUdpPeers(): void {
   const now = Date.now()
   let changed = false
-
-  for (const [id, peer] of peers.entries()) {
+  for (const [id, peer] of udpPeers.entries()) {
     if (now - peer.lastSeen > PEER_TTL_MS) {
-      peers.delete(id)
+      udpPeers.delete(id)
       changed = true
     }
   }
-
   if (changed) emitDevicesUpdated()
 }
 
-function startDiscoveryService(): void {
+function pruneWebPeers(): void {
+  const now = Date.now()
+  let changed = false
+  for (const [id, peer] of webPeers.entries()) {
+    if (now - peer.lastSeen > WEB_PEER_TTL_MS) {
+      webPeers.delete(id)
+      changed = true
+    }
+  }
+  if (changed) emitDevicesUpdated()
+}
+
+function startUdpDiscovery(): void {
   const socket = createSocket({ type: 'udp4', reuseAddr: true })
   discoverySocket = socket
-
-  socket.on('message', (msg, remote) => {
-    handleWireMessage(msg, remote.address)
-  })
-
+  socket.on('message', (msg, remote) => handleWireMessage(msg, remote.address))
   socket.on('error', (error) => {
     debugState.lastError = String(error)
-    console.error('LAN discovery socket error:', error)
   })
-
   socket.bind(DISCOVERY_PORT, () => {
     socket.setBroadcast(true)
-    debugState.localAddresses = getLocalIPv4Addresses()
     announceSelf()
     void triggerActiveDiscovery()
   })
@@ -632,38 +649,61 @@ function startDiscoveryService(): void {
   discoverySweepTimer = setInterval(() => {
     void triggerActiveDiscovery()
   }, DISCOVERY_SWEEP_INTERVAL_MS)
-  pruneTimer = setInterval(prunePeers, 1_500)
+  pruneTimer = setInterval(() => {
+    pruneUdpPeers()
+    pruneWebPeers()
+  }, 1_500)
 }
 
-function stopDiscoveryService(): void {
+function stopUdpDiscovery(): void {
   if (announceTimer) clearInterval(announceTimer)
   if (discoverySweepTimer) clearInterval(discoverySweepTimer)
   if (pruneTimer) clearInterval(pruneTimer)
   announceTimer = null
   discoverySweepTimer = null
   pruneTimer = null
-
   if (discoverySocket) {
     discoverySocket.close()
     discoverySocket = null
   }
-
   pendingRequests.clear()
-  peers.clear()
+  udpPeers.clear()
+}
+
+function startAdbDiscovery(): void {
+  void refreshAdbDevices().catch((error) => {
+    debugState.lastError = String(error)
+  })
+  adbScanTimer = setInterval(() => {
+    void refreshAdbDevices().catch((error) => {
+      debugState.lastError = String(error)
+    })
+  }, ADB_SCAN_INTERVAL_MS)
+}
+
+function stopAdbDiscovery(): void {
+  if (adbScanTimer) {
+    clearInterval(adbScanTimer)
+    adbScanTimer = null
+  }
+  adbPeers.clear()
 }
 
 async function requestPeerInfo(deviceId: string): Promise<DeviceRecord | null> {
-  const known = peers.get(deviceId)
-  if (!known) return null
-  if (deviceId.startsWith(WEB_PEER_PREFIX)) return known
+  const adb = adbPeers.get(deviceId)
+  if (adb) return adb
+
+  const web = webPeers.get(deviceId)
+  if (web) return web
+
+  const knownUdp = udpPeers.get(deviceId)
+  if (!knownUdp) return null
 
   const requestId = randomUUID()
-  const targetAddress = known.address || BROADCAST_ADDRESS
-
   const responsePromise = new Promise<DeviceRecord | null>((resolve) => {
     const timeout = setTimeout(() => {
       pendingRequests.delete(requestId)
-      resolve(peers.get(deviceId) ?? null)
+      resolve(udpPeers.get(deviceId) ?? null)
     }, 2_000)
 
     pendingRequests.set(requestId, (device) => {
@@ -681,14 +721,13 @@ async function requestPeerInfo(deviceId: string): Promise<DeviceRecord | null> {
         requestId
       }
     },
-    targetAddress
+    knownUdp.address || BROADCAST_ADDRESS
   )
 
   return responsePromise
 }
 
 function createWindow(): void {
-  // Create the browser window.
   const mainWindow = new BrowserWindow({
     width: 900,
     height: 670,
@@ -702,18 +741,14 @@ function createWindow(): void {
   })
 
   mainWindowRef = mainWindow
-
   mainWindow.on('ready-to-show', () => {
     mainWindow.show()
   })
-
   mainWindow.webContents.setWindowOpenHandler((details) => {
     shell.openExternal(details.url)
     return { action: 'deny' }
   })
 
-  // HMR for renderer base on electron-vite cli.
-  // Load the remote URL for development or the local html file for production.
   if (is.dev && process.env['ELECTRON_RENDERER_URL']) {
     mainWindow.loadURL(process.env['ELECTRON_RENDERER_URL'])
   } else {
@@ -721,22 +756,15 @@ function createWindow(): void {
   }
 }
 
-// This method will be called when Electron has finished
-// initialization and is ready to create browser windows.
-// Some APIs can only be used after this event occurs.
 app.whenReady().then(() => {
-  // Set app user model id for windows
   electronApp.setAppUserModelId('com.electron')
 
-  // Default open or close DevTools by F12 in development
-  // and ignore CommandOrControl + R in production.
-  // see https://github.com/alex8088/electron-toolkit/tree/master/packages/utils
   app.on('browser-window-created', (_, window) => {
     optimizer.watchWindowShortcuts(window)
   })
 
   ipcMain.handle('lan:get-devices', () => {
-    return Array.from(peers.values()).sort((a, b) => a.name.localeCompare(b.name))
+    return getAllPeers().sort((a, b) => a.name.localeCompare(b.name))
   })
 
   ipcMain.handle('lan:get-local-device', () => createLocalDeviceRecord())
@@ -747,7 +775,7 @@ app.whenReady().then(() => {
 
   ipcMain.handle('lan:refresh-discovery', async () => {
     announceSelf()
-    await triggerActiveDiscovery()
+    await Promise.allSettled([triggerActiveDiscovery(), refreshAdbDevices()])
     return true
   })
 
@@ -759,21 +787,16 @@ app.whenReady().then(() => {
     return getPairingInfo()
   })
 
-  startDiscoveryService()
+  startUdpDiscovery()
+  startAdbDiscovery()
   startWebPairService()
-
   createWindow()
 
   app.on('activate', function () {
-    // On macOS it's common to re-create a window in the app when the
-    // dock icon is clicked and there are no other windows open.
     if (BrowserWindow.getAllWindows().length === 0) createWindow()
   })
 })
 
-// Quit when all windows are closed, except on macOS. There, it's common
-// for applications and their menu bar to stay active until the user quits
-// explicitly with Cmd + Q.
 app.on('window-all-closed', () => {
   if (process.platform !== 'darwin') {
     app.quit()
@@ -781,9 +804,7 @@ app.on('window-all-closed', () => {
 })
 
 app.on('before-quit', () => {
-  stopDiscoveryService()
+  stopUdpDiscovery()
+  stopAdbDiscovery()
   stopWebPairService()
 })
-
-// In this file you can include the rest of your app's specific main process
-// code. You can also put them in separate files and require them here.
