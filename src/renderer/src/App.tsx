@@ -407,6 +407,38 @@ function App(): React.JSX.Element {
     }
   }
 
+  function cropImageDataUrl(sourceDataUrl: string, crop: PixelCrop): Promise<string> {
+    return new Promise((resolve) => {
+      const image = new Image()
+      image.onload = () => {
+        const sourceW = image.naturalWidth || image.width
+        const sourceH = image.naturalHeight || image.height
+        if (!sourceW || !sourceH) {
+          resolve('')
+          return
+        }
+
+        const sx = Math.max(0, Math.min(sourceW - 1, Math.round(crop.x)))
+        const sy = Math.max(0, Math.min(sourceH - 1, Math.round(crop.y)))
+        const sw = Math.max(1, Math.min(sourceW - sx, Math.round(crop.width)))
+        const sh = Math.max(1, Math.min(sourceH - sy, Math.round(crop.height)))
+
+        const canvas = document.createElement('canvas')
+        canvas.width = sw
+        canvas.height = sh
+        const ctx = canvas.getContext('2d')
+        if (!ctx) {
+          resolve('')
+          return
+        }
+        ctx.drawImage(image, sx, sy, sw, sh, 0, 0, sw, sh)
+        resolve(canvas.toDataURL('image/png'))
+      }
+      image.onerror = () => resolve('')
+      image.src = sourceDataUrl
+    })
+  }
+
   useEffect(() => {
     const stage = stageRef.current
     if (!stage || !compare) return
@@ -681,8 +713,25 @@ function App(): React.JSX.Element {
         const overlapRect = getOverlapRect(localBounds, remoteBounds)
         if (!overlapRect) return
 
+        const localCrop = mapStageOverlapToLocalScreenPixels(
+          overlapRect,
+          localBounds,
+          compare.local.resolution
+        )
+
         const fullFrame = await captureFullScreenImage()
-        const imageDataUrl = fullFrame.imageDataUrl
+        if (!fullFrame.imageDataUrl || !fullFrame.width || !fullFrame.height) return
+
+        const scaleX = fullFrame.width / Math.max(1, compare.local.resolution.width)
+        const scaleY = fullFrame.height / Math.max(1, compare.local.resolution.height)
+        const sourceCrop: PixelCrop = {
+          x: Math.round(localCrop.x * scaleX),
+          y: Math.round(localCrop.y * scaleY),
+          width: Math.max(1, Math.round(localCrop.width * scaleX)),
+          height: Math.max(1, Math.round(localCrop.height * scaleY))
+        }
+
+        const imageDataUrl = await cropImageDataUrl(fullFrame.imageDataUrl, sourceCrop)
         if (!imageDataUrl) return
 
         const now = Date.now()
@@ -694,10 +743,10 @@ function App(): React.JSX.Element {
         await window.api.projectionPush(projectionSessionId, {
           imageDataUrl,
           overlap: {
-            width: fullFrame.width,
-            height: fullFrame.height,
-            left: 0,
-            top: 0
+            width: localCrop.width,
+            height: localCrop.height,
+            left: localCrop.x,
+            top: localCrop.y
           }
         })
       })()
