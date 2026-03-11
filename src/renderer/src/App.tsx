@@ -44,6 +44,14 @@ type PairingInfo = {
   urls: string[]
 }
 
+type CompareLayout = {
+  localPhysical: ReturnType<typeof toPhysical>
+  remotePhysical: ReturnType<typeof toPhysical>
+  localRect: { width: number; height: number }
+  remoteRect: { width: number; height: number }
+  pxPerMm: number
+}
+
 const LIST_HEIGHT = 420
 const ROW_HEIGHT = 62
 const OVERSCAN = 6
@@ -72,16 +80,64 @@ function toPhysical(device: DeviceInfo): {
   }
 }
 
-function clampRectSize(widthMm: number, heightMm: number): { width: number; height: number } {
-  const pxPerMm = 1.45
-  const width = Math.max(70, Math.round(widthMm * pxPerMm))
-  const height = Math.max(70, Math.round(heightMm * pxPerMm))
-  const maxSide = 380
-  const ratio = Math.min(1, maxSide / Math.max(width, height))
+function buildCompareLayout(local: DeviceInfo, remote: DeviceInfo): CompareLayout {
+  const localPhysical = toPhysical(local)
+  const remotePhysical = toPhysical(remote)
+
+  const basePxPerMm = 1.45
+  const maxDisplaySide = 430
+
+  const rawLocalW = localPhysical.widthMm * basePxPerMm
+  const rawLocalH = localPhysical.heightMm * basePxPerMm
+  const rawRemoteW = remotePhysical.widthMm * basePxPerMm
+  const rawRemoteH = remotePhysical.heightMm * basePxPerMm
+
+  const maxRawSide = Math.max(rawLocalW, rawLocalH, rawRemoteW, rawRemoteH, 1)
+  const fitRatio = Math.min(1, maxDisplaySide / maxRawSide)
+  const pxPerMm = basePxPerMm * fitRatio
 
   return {
-    width: Math.round(width * ratio),
-    height: Math.round(height * ratio)
+    localPhysical,
+    remotePhysical,
+    localRect: {
+      width: Math.max(70, Math.round(localPhysical.widthMm * pxPerMm)),
+      height: Math.max(70, Math.round(localPhysical.heightMm * pxPerMm))
+    },
+    remoteRect: {
+      width: Math.max(70, Math.round(remotePhysical.widthMm * pxPerMm)),
+      height: Math.max(70, Math.round(remotePhysical.heightMm * pxPerMm))
+    },
+    pxPerMm
+  }
+}
+
+function snapAxis(remoteCenter: number, remoteHalf: number, localHalf: number, threshold: number): { snapped: number; guide: number | null } {
+  const remoteRefs = [
+    { pos: remoteCenter - remoteHalf, centerDelta: remoteHalf },
+    { pos: remoteCenter, centerDelta: 0 },
+    { pos: remoteCenter + remoteHalf, centerDelta: -remoteHalf }
+  ]
+  const localRefs = [-localHalf, 0, localHalf]
+
+  let bestDelta = 0
+  let bestDistance = Number.POSITIVE_INFINITY
+  let guide: number | null = null
+
+  for (const remoteRef of remoteRefs) {
+    for (const localRef of localRefs) {
+      const distance = localRef - remoteRef.pos
+      const absDistance = Math.abs(distance)
+      if (absDistance <= threshold && absDistance < bestDistance) {
+        bestDistance = absDistance
+        bestDelta = distance
+        guide = localRef
+      }
+    }
+  }
+
+  return {
+    snapped: remoteCenter + bestDelta,
+    guide
   }
 }
 
@@ -97,6 +153,9 @@ function App(): React.JSX.Element {
   const [debugInfo, setDebugInfo] = useState<DiscoveryDebugInfo | null>(null)
   const [pairingInfo, setPairingInfo] = useState<PairingInfo | null>(null)
   const [pairQrDataUrl, setPairQrDataUrl] = useState('')
+  const [snapGuides, setSnapGuides] = useState<{ x: number | null; y: number | null }>({ x: null, y: null })
+  const [stageSize, setStageSize] = useState({ width: 900, height: 540 })
+  const stageRef = useRef<HTMLElement | null>(null)
   const dragStateRef = useRef<{ active: boolean; startX: number; startY: number; x: number; y: number }>({
     active: false,
     startX: 0,
@@ -157,17 +216,58 @@ function App(): React.JSX.Element {
   }, [])
 
   useEffect(() => {
+    const stage = stageRef.current
+    if (!stage || !compare) return
+
+    const refreshSize = (): void => {
+      setStageSize({
+        width: stage.clientWidth,
+        height: stage.clientHeight
+      })
+    }
+
+    refreshSize()
+    const observer = new ResizeObserver(refreshSize)
+    observer.observe(stage)
+
+    return () => {
+      observer.disconnect()
+    }
+  }, [compare])
+
+  const compareLayout = useMemo(() => {
+    if (!compare) return null
+    return buildCompareLayout(compare.local, compare.remote)
+  }, [compare])
+
+  useEffect(() => {
+    if (!compareLayout) return
+
     const onPointerMove = (event: PointerEvent): void => {
       const state = dragStateRef.current
       if (!state.active) return
+
+      const nextX = state.x + (event.clientX - state.startX)
+      const nextY = state.y + (event.clientY - state.startY)
+
+      const localHalfW = compareLayout.localRect.width / 2
+      const localHalfH = compareLayout.localRect.height / 2
+      const remoteHalfW = compareLayout.remoteRect.width / 2
+      const remoteHalfH = compareLayout.remoteRect.height / 2
+
+      const snappedX = snapAxis(nextX, remoteHalfW, localHalfW, 12)
+      const snappedY = snapAxis(nextY, remoteHalfH, localHalfH, 12)
+
       setDragOffset({
-        x: state.x + (event.clientX - state.startX),
-        y: state.y + (event.clientY - state.startY)
+        x: snappedX.snapped,
+        y: snappedY.snapped
       })
+      setSnapGuides({ x: snappedX.guide, y: snappedY.guide })
     }
 
     const onPointerUp = (): void => {
       dragStateRef.current.active = false
+      setSnapGuides({ x: null, y: null })
     }
 
     window.addEventListener('pointermove', onPointerMove)
@@ -177,7 +277,7 @@ function App(): React.JSX.Element {
       window.removeEventListener('pointermove', onPointerMove)
       window.removeEventListener('pointerup', onPointerUp)
     }
-  }, [])
+  }, [compareLayout])
 
   const filteredDevices = useMemo(() => {
     const term = query.trim().toLowerCase()
@@ -294,14 +394,29 @@ function App(): React.JSX.Element {
       x: dragOffset.x,
       y: dragOffset.y
     }
+    setSnapGuides({ x: null, y: null })
     event.currentTarget.setPointerCapture(event.pointerId)
   }
 
   if (compare) {
-    const localPhysical = toPhysical(compare.local)
-    const remotePhysical = toPhysical(compare.remote)
-    const localRect = clampRectSize(localPhysical.widthMm, localPhysical.heightMm)
-    const remoteRect = clampRectSize(remotePhysical.widthMm, remotePhysical.heightMm)
+    if (!compareLayout) return <main className="app-shell" />
+
+    const localPhysical = compareLayout.localPhysical
+    const remotePhysical = compareLayout.remotePhysical
+    const localRect = compareLayout.localRect
+    const remoteRect = compareLayout.remoteRect
+    const rulerExtentX = Math.floor(stageSize.width / (2 * compareLayout.pxPerMm))
+    const rulerExtentY = Math.floor(stageSize.height / (2 * compareLayout.pxPerMm))
+    const rulerStepMm = 10
+    const rulerMarksX: number[] = []
+    const rulerMarksY: number[] = []
+
+    for (let mm = -rulerExtentX; mm <= rulerExtentX; mm += rulerStepMm) {
+      rulerMarksX.push(mm)
+    }
+    for (let mm = -rulerExtentY; mm <= rulerExtentY; mm += rulerStepMm) {
+      rulerMarksY.push(mm)
+    }
 
     return (
       <main className="app-shell compare-shell">
@@ -312,7 +427,34 @@ function App(): React.JSX.Element {
           <p className="hint">拖拽右侧设备图进行位置微调</p>
         </header>
 
-        <section className="stage">
+        <section className="stage" ref={stageRef}>
+          <div className="ruler ruler-x">
+            {rulerMarksX.map((mm) => {
+              const px = mm * compareLayout.pxPerMm
+              const major = mm % 50 === 0
+              return (
+                <div key={`rx-${mm}`} className={`ruler-tick x ${major ? 'major' : ''}`} style={{ left: `calc(50% + ${px}px)` }}>
+                  {major ? <span>{mm}mm</span> : null}
+                </div>
+              )
+            })}
+          </div>
+
+          <div className="ruler ruler-y">
+            {rulerMarksY.map((mm) => {
+              const px = mm * compareLayout.pxPerMm
+              const major = mm % 50 === 0
+              return (
+                <div key={`ry-${mm}`} className={`ruler-tick y ${major ? 'major' : ''}`} style={{ top: `calc(50% + ${px}px)` }}>
+                  {major ? <span>{mm}mm</span> : null}
+                </div>
+              )
+            })}
+          </div>
+
+          {snapGuides.x !== null ? <div className="snap-line vertical" style={{ left: `calc(50% + ${snapGuides.x}px)` }} /> : null}
+          {snapGuides.y !== null ? <div className="snap-line horizontal" style={{ top: `calc(50% + ${snapGuides.y}px)` }} /> : null}
+
           <div className="device-rect local" style={{ width: localRect.width, height: localRect.height }}>
             <h3>{compare.local.name} (本机)</h3>
             <p>

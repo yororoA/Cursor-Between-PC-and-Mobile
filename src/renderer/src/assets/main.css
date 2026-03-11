@@ -252,8 +252,94 @@ body {
   background-size: 22px 22px;
 }
 
+.ruler {
+  position: absolute;
+  z-index: 2;
+  pointer-events: none;
+}
+
+.ruler-x {
+  left: 30px;
+  right: 10px;
+  top: 8px;
+  height: 22px;
+}
+
+.ruler-y {
+  top: 30px;
+  bottom: 10px;
+  left: 8px;
+  width: 24px;
+}
+
+.ruler-tick {
+  position: absolute;
+}
+
+.ruler-tick.x {
+  top: 0;
+  width: 1px;
+  height: 8px;
+  background: rgba(185, 214, 247, 0.62);
+}
+
+.ruler-tick.y {
+  left: 0;
+  width: 8px;
+  height: 1px;
+  background: rgba(185, 214, 247, 0.62);
+}
+
+.ruler-tick.major.x {
+  height: 13px;
+  background: rgba(255, 216, 134, 0.88);
+}
+
+.ruler-tick.major.y {
+  width: 13px;
+  background: rgba(255, 216, 134, 0.88);
+}
+
+.ruler-tick span {
+  position: absolute;
+  font-size: 10px;
+  color: rgba(255, 236, 186, 0.92);
+  white-space: nowrap;
+}
+
+.ruler-tick.x span {
+  top: 14px;
+  left: 3px;
+}
+
+.ruler-tick.y span {
+  left: 14px;
+  top: -5px;
+}
+
+.snap-line {
+  position: absolute;
+  z-index: 2;
+  pointer-events: none;
+}
+
+.snap-line.vertical {
+  top: 0;
+  bottom: 0;
+  width: 1px;
+  background: linear-gradient(180deg, rgba(255, 215, 127, 0.15), rgba(255, 215, 127, 0.95), rgba(255, 215, 127, 0.15));
+}
+
+.snap-line.horizontal {
+  left: 0;
+  right: 0;
+  height: 1px;
+  background: linear-gradient(90deg, rgba(255, 215, 127, 0.15), rgba(255, 215, 127, 0.95), rgba(255, 215, 127, 0.15));
+}
+
 .device-rect {
   position: absolute;
+  z-index: 3;
   display: flex;
   flex-direction: column;
   justify-content: center;
