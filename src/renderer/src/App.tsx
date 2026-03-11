@@ -264,6 +264,7 @@ function App(): React.JSX.Element {
   const captureVideoRef = useRef<HTMLVideoElement | null>(null)
   const captureCanvasRef = useRef<HTMLCanvasElement | null>(null)
   const cropCanvasRef = useRef<HTMLCanvasElement | null>(null)
+  const captureProbeCanvasRef = useRef<HTMLCanvasElement | null>(null)
   const dragStateRef = useRef<{ active: boolean; startX: number; startY: number; x: number; y: number }>({
     active: false,
     startX: 0,
@@ -380,11 +381,16 @@ function App(): React.JSX.Element {
     }
 
     try {
+      const videoConstraints = {
+        frameRate: { ideal: 12, max: 15 },
+        displaySurface: 'monitor',
+        // Electron/Chromium 扩展约束，尽量避免抓到当前应用表面导致黑帧。
+        selfBrowserSurface: 'exclude',
+        surfaceSwitching: 'exclude'
+      } as MediaTrackConstraints
+
       const stream = await navigator.mediaDevices.getDisplayMedia({
-        video: {
-          frameRate: { ideal: 12, max: 15 },
-          displaySurface: 'monitor'
-        },
+        video: videoConstraints,
         audio: false
       })
 
@@ -393,6 +399,38 @@ function App(): React.JSX.Element {
       video.muted = true
       video.playsInline = true
       await video.play()
+
+      await new Promise((resolve) => window.setTimeout(resolve, 120))
+
+      const probeCanvas = captureProbeCanvasRef.current || document.createElement('canvas')
+      probeCanvas.width = 32
+      probeCanvas.height = 18
+      captureProbeCanvasRef.current = probeCanvas
+      const probeCtx = probeCanvas.getContext('2d', { willReadFrequently: true })
+      if (!probeCtx) {
+        throw new Error('采集探针初始化失败')
+      }
+      probeCtx.clearRect(0, 0, probeCanvas.width, probeCanvas.height)
+      probeCtx.drawImage(video, 0, 0, probeCanvas.width, probeCanvas.height)
+      const data = probeCtx.getImageData(0, 0, probeCanvas.width, probeCanvas.height).data
+      let brightPixels = 0
+      for (let i = 0; i < data.length; i += 4) {
+        const r = data[i] || 0
+        const g = data[i + 1] || 0
+        const b = data[i + 2] || 0
+        const a = data[i + 3] || 0
+        if (a > 8 && r + g + b > 18) brightPixels += 1
+      }
+      if (brightPixels < 10) {
+        for (const track of stream.getTracks()) {
+          track.stop()
+        }
+        captureStreamRef.current = null
+        captureVideoRef.current = null
+        setScreenCaptureReady(false)
+        setProjectionStatusText('检测到黑屏采集，请在授权弹窗中选择“整个屏幕（非当前应用窗口）”后重试')
+        return false
+      }
 
       captureStreamRef.current = stream
       captureVideoRef.current = video

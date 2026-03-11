@@ -180,6 +180,7 @@ const pendingRequests = new Map<string, (device: DeviceRecord) => void>()
 const adbConnectCooldown = new Map<string, number>()
 const projectionStreams = new Map<string, ServerResponse>()
 const projectionSessions = new Map<string, ProjectionSession>()
+let receiverAutoCloseTimer: NodeJS.Timeout | null = null
 let latestIncomingProjectionFrame: {
   sessionId: string
   frameId: number
@@ -192,6 +193,8 @@ let latestIncomingProjectionFrame: {
   }
   sentAt: number
 } | null = null
+
+const RECEIVER_IDLE_CLOSE_MS = 6_000
 
 const debugState: DiscoveryDebugSnapshot = {
   startedAt: Date.now(),
@@ -521,6 +524,20 @@ function ensureReceiverWindow(): void {
   receiverWindow.loadURL(`http://127.0.0.1:${WEB_PAIR_PORT}/pair?receiver=1`)
 }
 
+function scheduleReceiverWindowAutoClose(): void {
+  if (receiverAutoCloseTimer) {
+    clearTimeout(receiverAutoCloseTimer)
+    receiverAutoCloseTimer = null
+  }
+
+  receiverAutoCloseTimer = setTimeout(() => {
+    if (receiverWindowRef && !receiverWindowRef.isDestroyed()) {
+      receiverWindowRef.close()
+    }
+    receiverAutoCloseTimer = null
+  }, RECEIVER_IDLE_CLOSE_MS)
+}
+
 function sendSseEvent(res: ServerResponse, event: string, payload: unknown): void {
   res.write(`event: ${event}\n`)
   res.write(`data: ${JSON.stringify(payload)}\n\n`)
@@ -539,6 +556,10 @@ function stopProjectionSession(session: ProjectionSession, message: string): voi
   session.status = 'stopped'
   session.lastMessage = message
   emitProjectionStatus(session)
+
+  if (session.transport === 'lan-push' && session.targetAddress) {
+    void notifyLanReceiverStop(session.targetAddress, session.sessionId)
+  }
 }
 
 function markProjectionStreamOffline(clientId: string): void {
@@ -708,6 +729,36 @@ function postProjectionFrameToLanReceiver(
       resolve({ ok: false, message: `局域网投映失败: ${String(error)}` })
     })
 
+    req.write(body)
+    req.end()
+  })
+}
+
+function notifyLanReceiverStop(targetAddress: string, sessionId: string): Promise<void> {
+  return new Promise((resolve) => {
+    const body = JSON.stringify({ sessionId })
+    const req = httpRequest({
+      host: targetAddress,
+      port: WEB_PAIR_PORT,
+      path: '/api/projection/stop',
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json; charset=utf-8',
+        'Content-Length': Buffer.byteLength(body)
+      },
+      timeout: 1200
+    })
+
+    req.on('timeout', () => {
+      req.destroy()
+      resolve()
+    })
+    req.on('error', () => {
+      resolve()
+    })
+    req.on('response', () => {
+      resolve()
+    })
     req.write(body)
     req.end()
   })
@@ -892,6 +943,7 @@ function handleIncomingProjectionPush(req: IncomingMessage, res: ServerResponse)
       }
 
       ensureReceiverWindow()
+      scheduleReceiverWindowAutoClose()
       let sentCount = 0
       for (const stream of projectionStreams.values()) {
         sendSseEvent(stream, 'projection-frame', latestIncomingProjectionFrame)
@@ -902,6 +954,32 @@ function handleIncomingProjectionPush(req: IncomingMessage, res: ServerResponse)
     } catch {
       writeJson(res, 400, { ok: false })
     }
+  })
+}
+
+function handleIncomingProjectionStop(req: IncomingMessage, res: ServerResponse): void {
+  let raw = ''
+  req.setEncoding('utf-8')
+
+  req.on('data', (chunk) => {
+    raw += chunk
+    if (raw.length > 10_000) {
+      raw = ''
+      writeJson(res, 413, { ok: false })
+      req.destroy()
+    }
+  })
+
+  req.on('end', () => {
+    if (receiverAutoCloseTimer) {
+      clearTimeout(receiverAutoCloseTimer)
+      receiverAutoCloseTimer = null
+    }
+    latestIncomingProjectionFrame = null
+    if (receiverWindowRef && !receiverWindowRef.isDestroyed()) {
+      receiverWindowRef.close()
+    }
+    writeJson(res, 200, { ok: true })
   })
 }
 
@@ -988,6 +1066,11 @@ function startWebPairService(): void {
 
     if (req.method === 'POST' && req.url === '/api/projection/push') {
       handleIncomingProjectionPush(req, res)
+      return
+    }
+
+    if (req.method === 'POST' && req.url === '/api/projection/stop') {
+      handleIncomingProjectionStop(req, res)
       return
     }
 
