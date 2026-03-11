@@ -1,7 +1,13 @@
 import { app, shell, BrowserWindow, ipcMain, screen, desktopCapturer, session } from 'electron'
 import { join } from 'path'
 import { createSocket, type Socket } from 'dgram'
-import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'http'
+import {
+  createServer,
+  request as httpRequest,
+  type IncomingMessage,
+  type Server,
+  type ServerResponse
+} from 'http'
 import { existsSync } from 'fs'
 import os from 'os'
 import { randomUUID } from 'crypto'
@@ -106,6 +112,8 @@ type ProjectionSession = {
   sessionId: string
   targetDeviceId: string
   targetClientId: string
+  transport: 'web-pull' | 'lan-push'
+  targetAddress: string
   active: boolean
   lastFrameId: number
   lastSentAt: number
@@ -121,11 +129,24 @@ type WireMessage =
   | { type: 'announce'; payload: DeviceRecord }
   | { type: 'query-info'; payload: { requesterId: string; targetId: string; requestId: string } }
   | {
-    type: 'info-response'
-    payload: { requestId: string; targetId: string; device: DeviceRecord }
-  }
+      type: 'info-response'
+      payload: { requestId: string; targetId: string; device: DeviceRecord }
+    }
   | { type: 'discover-request'; payload: { requestId: string } }
   | { type: 'discover-response'; payload: { requestId: string; device: DeviceRecord } }
+
+type IncomingProjectionFramePayload = {
+  sessionId?: string
+  frameId?: number
+  imageDataUrl?: string
+  overlap?: {
+    width: number
+    height: number
+    left: number
+    top: number
+  }
+  sentAt?: number
+}
 
 const DISCOVERY_PORT = 42425
 const WEB_PAIR_PORT = 42426
@@ -144,6 +165,7 @@ const localDeviceId = randomUUID()
 const localDeviceName = os.hostname()
 
 let mainWindowRef: BrowserWindow | null = null
+let receiverWindowRef: BrowserWindow | null = null
 let discoverySocket: Socket | null = null
 let webPairServer: Server | null = null
 let adbScanTimer: NodeJS.Timeout | null = null
@@ -158,6 +180,18 @@ const pendingRequests = new Map<string, (device: DeviceRecord) => void>()
 const adbConnectCooldown = new Map<string, number>()
 const projectionStreams = new Map<string, ServerResponse>()
 const projectionSessions = new Map<string, ProjectionSession>()
+let latestIncomingProjectionFrame: {
+  sessionId: string
+  frameId: number
+  imageDataUrl: string
+  overlap: {
+    width: number
+    height: number
+    left: number
+    top: number
+  }
+  sentAt: number
+} | null = null
 
 const debugState: DiscoveryDebugSnapshot = {
   startedAt: Date.now(),
@@ -428,12 +462,17 @@ function writeJson(res: ServerResponse, statusCode: number, payload: unknown): v
 }
 
 function toProjectionStatusSnapshot(session: ProjectionSession): ProjectionStatusSnapshot {
+  const streamOnline =
+    session.transport === 'web-pull'
+      ? projectionStreams.has(session.targetClientId)
+      : session.status !== 'offline'
+
   return {
     sessionId: session.sessionId,
     targetDeviceId: session.targetDeviceId,
     targetClientId: session.targetClientId,
     active: session.active,
-    streamOnline: projectionStreams.has(session.targetClientId),
+    streamOnline,
     lastFrameId: session.lastFrameId,
     lastSentAt: session.lastSentAt,
     lastAckFrameId: session.lastAckFrameId,
@@ -447,6 +486,39 @@ function toProjectionStatusSnapshot(session: ProjectionSession): ProjectionStatu
 function emitProjectionStatus(session: ProjectionSession): void {
   if (!mainWindowRef || mainWindowRef.isDestroyed()) return
   mainWindowRef.webContents.send('lan:projection-status', toProjectionStatusSnapshot(session))
+}
+
+function ensureReceiverWindow(): void {
+  if (receiverWindowRef && !receiverWindowRef.isDestroyed()) {
+    if (!receiverWindowRef.isVisible()) receiverWindowRef.show()
+    receiverWindowRef.focus()
+    return
+  }
+
+  const receiverWindow = new BrowserWindow({
+    width: 1280,
+    height: 720,
+    fullscreen: true,
+    frame: false,
+    backgroundColor: '#000000',
+    autoHideMenuBar: true,
+    show: false,
+    webPreferences: {
+      sandbox: false
+    }
+  })
+
+  receiverWindowRef = receiverWindow
+  receiverWindow.on('ready-to-show', () => {
+    receiverWindow.show()
+    receiverWindow.setFullScreen(true)
+    receiverWindow.focus()
+  })
+  receiverWindow.on('closed', () => {
+    if (receiverWindowRef === receiverWindow) receiverWindowRef = null
+  })
+
+  receiverWindow.loadURL(`http://127.0.0.1:${WEB_PAIR_PORT}/pair?receiver=1`)
 }
 
 function sendSseEvent(res: ServerResponse, event: string, payload: unknown): void {
@@ -471,7 +543,8 @@ function stopProjectionSession(session: ProjectionSession, message: string): voi
 
 function markProjectionStreamOffline(clientId: string): void {
   for (const session of projectionSessions.values()) {
-    if (session.targetClientId !== clientId || !session.active) continue
+    if (!session.active || session.transport !== 'web-pull') continue
+    if (session.targetClientId !== clientId) continue
     session.status = 'offline'
     session.lastMessage = '目标设备投映通道已断开'
     clearSessionAckTimer(session)
@@ -531,21 +604,36 @@ function handlePairHello(req: IncomingMessage, res: ServerResponse): void {
 
 function startProjectionSession(targetDeviceId: string): ProjectionStartResult {
   const isWebTarget = targetDeviceId.startsWith(WEB_PEER_PREFIX)
-  if (!isWebTarget) {
+  const udpTarget = udpPeers.get(targetDeviceId)
+
+  if (!isWebTarget && !udpTarget) {
     return {
       ok: false,
       sessionId: '',
       targetDeviceId,
-      message: '当前仅支持 Web 配对设备投映，请先让手机打开 /pair 页面'
+      message: '目标设备不可用，请确认局域网设备在线并已打开接收端'
     }
   }
 
-  const targetClientId = targetDeviceId.slice(WEB_PEER_PREFIX.length)
+  const targetClientId = isWebTarget ? targetDeviceId.slice(WEB_PEER_PREFIX.length) : targetDeviceId
+  const targetAddress = isWebTarget ? '' : normalizeRemoteAddress(udpTarget?.address)
+  if (!isWebTarget && !isIPv4Address(targetAddress)) {
+    return {
+      ok: false,
+      sessionId: '',
+      targetDeviceId,
+      message: '目标设备地址无效，无法建立局域网投映'
+    }
+  }
+
   const sessionId = randomUUID()
+  const online = isWebTarget ? projectionStreams.has(targetClientId) : true
   const session: ProjectionSession = {
     sessionId,
     targetDeviceId,
     targetClientId,
+    transport: isWebTarget ? 'web-pull' : 'lan-push',
+    targetAddress,
     active: true,
     lastFrameId: 0,
     lastSentAt: 0,
@@ -553,10 +641,12 @@ function startProjectionSession(targetDeviceId: string): ProjectionStartResult {
     lastAckAt: 0,
     waitingAckFrameId: 0,
     ackTimer: null,
-    status: projectionStreams.has(targetClientId) ? 'idle' : 'offline',
-    lastMessage: projectionStreams.has(targetClientId)
-      ? '投映会话已建立，等待发送帧'
-      : '目标设备未打开投映通道，请保持 /pair 页面前台'
+    status: online ? 'idle' : 'offline',
+    lastMessage: isWebTarget
+      ? online
+        ? '投映会话已建立，等待发送帧'
+        : '目标设备未打开投映通道，请保持 /pair 页面前台'
+      : '局域网投映会话已建立，发送端将直接推送到目标设备'
   }
 
   projectionSessions.set(sessionId, session)
@@ -570,10 +660,63 @@ function startProjectionSession(targetDeviceId: string): ProjectionStartResult {
   }
 }
 
-function pushProjectionFrame(
+function postProjectionFrameToLanReceiver(
+  targetAddress: string,
+  payload: {
+    sessionId: string
+    frameId: number
+    imageDataUrl: string
+    overlap: { width: number; height: number; left: number; top: number }
+    sentAt: number
+  }
+): Promise<{ ok: boolean; message: string }> {
+  return new Promise((resolve) => {
+    const body = JSON.stringify(payload)
+    const req = httpRequest(
+      {
+        host: targetAddress,
+        port: WEB_PAIR_PORT,
+        path: '/api/projection/push',
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json; charset=utf-8',
+          'Content-Length': Buffer.byteLength(body)
+        },
+        timeout: 1800
+      },
+      (res) => {
+        let raw = ''
+        res.setEncoding('utf-8')
+        res.on('data', (chunk) => {
+          raw += chunk
+        })
+        res.on('end', () => {
+          const statusOk = (res.statusCode || 500) >= 200 && (res.statusCode || 500) < 300
+          resolve({
+            ok: statusOk,
+            message: statusOk ? '局域网投映已送达' : raw || `HTTP ${res.statusCode || 500}`
+          })
+        })
+      }
+    )
+
+    req.on('timeout', () => {
+      req.destroy(new Error('timeout'))
+    })
+
+    req.on('error', (error) => {
+      resolve({ ok: false, message: `局域网投映失败: ${String(error)}` })
+    })
+
+    req.write(body)
+    req.end()
+  })
+}
+
+async function pushProjectionFrame(
   sessionId: string,
   payload: ProjectionPushPayload
-): ProjectionPushResult {
+): Promise<ProjectionPushResult> {
   const session = projectionSessions.get(sessionId)
   if (!session || !session.active) {
     return {
@@ -581,6 +724,50 @@ function pushProjectionFrame(
       sessionId,
       frameId: 0,
       message: '投映会话不存在或已关闭'
+    }
+  }
+
+  clearSessionAckTimer(session)
+  const nextFrameId = session.lastFrameId + 1
+  session.lastFrameId = nextFrameId
+  session.lastSentAt = Date.now()
+  session.waitingAckFrameId = nextFrameId
+  if (session.transport === 'web-pull') {
+    session.status = 'waiting-ack'
+    session.lastMessage = `已发送帧 #${nextFrameId}，等待目标设备 ACK`
+  }
+
+  if (session.transport === 'lan-push') {
+    const result = await postProjectionFrameToLanReceiver(session.targetAddress, {
+      sessionId: session.sessionId,
+      frameId: nextFrameId,
+      imageDataUrl: payload.imageDataUrl,
+      overlap: payload.overlap,
+      sentAt: session.lastSentAt
+    })
+
+    if (result.ok) {
+      session.lastAckFrameId = nextFrameId
+      session.lastAckAt = Date.now()
+      session.status = 'receiving'
+      session.lastMessage = `目标设备已接收帧 #${nextFrameId}`
+      emitProjectionStatus(session)
+      return {
+        ok: true,
+        sessionId,
+        frameId: nextFrameId,
+        message: `frame #${nextFrameId} sent`
+      }
+    }
+
+    session.status = 'offline'
+    session.lastMessage = result.message
+    emitProjectionStatus(session)
+    return {
+      ok: false,
+      sessionId,
+      frameId: session.lastFrameId,
+      message: result.message
     }
   }
 
@@ -596,14 +783,6 @@ function pushProjectionFrame(
       message: session.lastMessage
     }
   }
-
-  clearSessionAckTimer(session)
-  const nextFrameId = session.lastFrameId + 1
-  session.lastFrameId = nextFrameId
-  session.lastSentAt = Date.now()
-  session.waitingAckFrameId = nextFrameId
-  session.status = 'waiting-ack'
-  session.lastMessage = `已发送帧 #${nextFrameId}，等待目标设备 ACK`
 
   sendSseEvent(stream, 'projection-frame', {
     sessionId: session.sessionId,
@@ -679,6 +858,53 @@ function handleProjectionAck(req: IncomingMessage, res: ServerResponse): void {
   })
 }
 
+function handleIncomingProjectionPush(req: IncomingMessage, res: ServerResponse): void {
+  let raw = ''
+  req.setEncoding('utf-8')
+
+  req.on('data', (chunk) => {
+    raw += chunk
+    if (raw.length > 10_000_000) {
+      raw = ''
+      writeJson(res, 413, { ok: false, message: 'frame too large' })
+      req.destroy()
+    }
+  })
+
+  req.on('end', () => {
+    try {
+      const parsed = JSON.parse(raw) as IncomingProjectionFramePayload
+      const imageDataUrl = String(parsed.imageDataUrl || '')
+      const sessionId = String(parsed.sessionId || '')
+      const frameId = Math.max(0, Number(parsed.frameId) || 0)
+      const overlap = parsed.overlap || { width: 0, height: 0, left: 0, top: 0 }
+      if (!imageDataUrl) {
+        writeJson(res, 400, { ok: false, message: 'imageDataUrl required' })
+        return
+      }
+
+      latestIncomingProjectionFrame = {
+        sessionId,
+        frameId,
+        imageDataUrl,
+        overlap,
+        sentAt: Math.max(Date.now(), Number(parsed.sentAt) || Date.now())
+      }
+
+      ensureReceiverWindow()
+      let sentCount = 0
+      for (const stream of projectionStreams.values()) {
+        sendSseEvent(stream, 'projection-frame', latestIncomingProjectionFrame)
+        sentCount += 1
+      }
+
+      writeJson(res, 200, { ok: true, rendered: sentCount > 0, streams: sentCount })
+    } catch {
+      writeJson(res, 400, { ok: false })
+    }
+  })
+}
+
 function startWebPairService(): void {
   const server = createServer((req, res) => {
     if (!req.url) {
@@ -733,6 +959,9 @@ function startWebPairService(): void {
       res.write(': connected\n\n')
 
       projectionStreams.set(clientId, res)
+      if (latestIncomingProjectionFrame) {
+        sendSseEvent(res, 'projection-frame', latestIncomingProjectionFrame)
+      }
       for (const session of projectionSessions.values()) {
         if (session.targetClientId !== clientId || !session.active) continue
         if (session.status === 'offline') {
@@ -754,6 +983,11 @@ function startWebPairService(): void {
 
     if (req.method === 'POST' && req.url === '/api/projection/ack') {
       handleProjectionAck(req, res)
+      return
+    }
+
+    if (req.method === 'POST' && req.url === '/api/projection/push') {
+      handleIncomingProjectionPush(req, res)
       return
     }
 
