@@ -334,6 +334,22 @@ function App(): React.JSX.Element {
   }, [])
 
   useEffect(() => {
+    if (!compare) {
+      document.body.classList.remove('overlay-mode')
+      void window.api.setOverlayMode(false)
+      return
+    }
+
+    document.body.classList.add('overlay-mode')
+    void window.api.setOverlayMode(true)
+
+    return () => {
+      document.body.classList.remove('overlay-mode')
+      void window.api.setOverlayMode(false)
+    }
+  }, [compare])
+
+  useEffect(() => {
     return () => {
       if (projectionSessionId) {
         void window.api.projectionStop(projectionSessionId)

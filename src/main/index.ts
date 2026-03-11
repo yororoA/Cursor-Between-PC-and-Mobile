@@ -1,4 +1,4 @@
-import { app, shell, BrowserWindow, ipcMain, screen } from 'electron'
+import { app, shell, BrowserWindow, ipcMain, screen, desktopCapturer, session } from 'electron'
 import { join } from 'path'
 import { createSocket, type Socket } from 'dgram'
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'http'
@@ -1256,6 +1256,28 @@ function createWindow(): void {
 app.whenReady().then(() => {
   electronApp.setAppUserModelId('com.electron')
 
+  session.defaultSession.setDisplayMediaRequestHandler(
+    async (_request, callback) => {
+      try {
+        const sources = await desktopCapturer.getSources({
+          types: ['screen'],
+          thumbnailSize: { width: 0, height: 0 }
+        })
+        const primary = sources[0]
+        if (!primary) {
+          callback({})
+          return
+        }
+        callback({ video: primary })
+      } catch {
+        callback({})
+      }
+    },
+    {
+      useSystemPicker: false
+    }
+  )
+
   app.on('browser-window-created', (_, window) => {
     optimizer.watchWindowShortcuts(window)
   })
@@ -1322,6 +1344,16 @@ app.whenReady().then(() => {
     const session = projectionSessions.get(sessionId)
     if (!session) return null
     return toProjectionStatusSnapshot(session)
+  })
+
+  ipcMain.handle('ui:set-overlay-mode', (_event, enabled: boolean) => {
+    if (!mainWindowRef || mainWindowRef.isDestroyed()) return false
+    mainWindowRef.setAlwaysOnTop(Boolean(enabled), 'screen-saver')
+    mainWindowRef.setFullScreen(Boolean(enabled))
+    mainWindowRef.setVisibleOnAllWorkspaces(Boolean(enabled), {
+      visibleOnFullScreen: true
+    })
+    return true
   })
 
   startUdpDiscovery()
