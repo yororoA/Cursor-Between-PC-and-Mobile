@@ -70,6 +70,8 @@ const DISCOVERY_PORT = 42425
 const WEB_PAIR_PORT = 42426
 const BROADCAST_ADDRESS = '255.255.255.255'
 const ADB_SCAN_INTERVAL_MS = 3_000
+const ADB_CONNECT_COOLDOWN_MS = 12_000
+const ADB_DEFAULT_TCP_PORT = 5555
 const ANNOUNCE_INTERVAL_MS = 3_000
 const DISCOVERY_SWEEP_INTERVAL_MS = 12_000
 const PEER_TTL_MS = 10_000
@@ -91,6 +93,7 @@ const udpPeers = new Map<string, DeviceRecord>()
 const adbPeers = new Map<string, DeviceRecord>()
 const webPeers = new Map<string, DeviceRecord>()
 const pendingRequests = new Map<string, (device: DeviceRecord) => void>()
+const adbConnectCooldown = new Map<string, number>()
 
 const debugState: DiscoveryDebugSnapshot = {
   startedAt: Date.now(),
@@ -138,13 +141,16 @@ function getDiscoveryDebugSnapshot(): DiscoveryDebugSnapshot {
 
 function createLocalDeviceRecord(): DeviceRecord {
   const display = screen.getPrimaryDisplay()
-  const bounds = display.size
-  const dpi = Math.max(72, Math.round(96 * (display.scaleFactor || 1)))
+  const scaleFactor = display.scaleFactor > 0 ? display.scaleFactor : 1
+  // Electron reports `display.size` in DIP, convert to real pixels for accurate comparison.
+  const width = Math.max(1, Math.round(display.size.width * scaleFactor))
+  const height = Math.max(1, Math.round(display.size.height * scaleFactor))
+  const dpi = Math.max(96, Math.round(96 * scaleFactor))
   return {
     id: localDeviceId,
     name: localDeviceName,
     address: '',
-    resolution: { width: bounds.width, height: bounds.height },
+    resolution: { width, height },
     dpi,
     lastSeen: Date.now()
   }
@@ -413,12 +419,102 @@ function parseAdbSerials(output: string): string[] {
     .filter(Boolean)
   for (const line of lines) {
     if (line.startsWith('List of devices attached')) continue
-    if (line.includes('unauthorized') || line.includes('offline')) continue
-    if (!line.includes('device')) continue
-    const serial = line.split(/\s+/)[0]
+    const segments = line.split(/\s+/)
+    const serial = segments[0]
+    const state = segments[1]
+    if (!serial || state !== 'device') continue
     if (serial) serials.push(serial)
   }
   return serials
+}
+
+function isIPv4Address(value: string): boolean {
+  const parts = value.split('.')
+  if (parts.length !== 4) return false
+  return parts.every((part) => {
+    if (!/^\d{1,3}$/.test(part)) return false
+    const num = Number(part)
+    return num >= 0 && num <= 255
+  })
+}
+
+function normalizeAdbConnectTarget(raw: string): string | null {
+  const text = raw.trim().replace(/^adb:/, '')
+  if (!text) return null
+
+  if (text.includes(':')) {
+    const [host, portRaw] = text.split(':')
+    const port = Number(portRaw)
+    if (!host || !isIPv4Address(host) || !Number.isInteger(port) || port < 1 || port > 65535) {
+      return null
+    }
+    return `${host}:${port}`
+  }
+
+  if (!isIPv4Address(text)) return null
+  return `${text}:${ADB_DEFAULT_TCP_PORT}`
+}
+
+function collectLanAdbConnectTargets(currentSerials: Set<string>): string[] {
+  const targets = new Set<string>()
+  const allPeers = [...udpPeers.values(), ...webPeers.values()]
+
+  for (const peer of allPeers) {
+    const normalized = normalizeAdbConnectTarget(peer.address)
+    if (!normalized) continue
+    if (currentSerials.has(normalized)) continue
+    targets.add(normalized)
+  }
+
+  return Array.from(targets)
+}
+
+function shouldTryAdbConnect(target: string): boolean {
+  const now = Date.now()
+  const previous = adbConnectCooldown.get(target) || 0
+  if (now - previous < ADB_CONNECT_COOLDOWN_MS) return false
+  adbConnectCooldown.set(target, now)
+  return true
+}
+
+async function connectAdbTarget(
+  adb: string,
+  targetRaw: string
+): Promise<{ ok: boolean; target: string; message: string }> {
+  const target = normalizeAdbConnectTarget(targetRaw)
+  if (!target) {
+    return {
+      ok: false,
+      target: targetRaw,
+      message: '目标地址无效，请使用 IPv4 或 IPv4:端口，例如 192.168.1.22:5555'
+    }
+  }
+
+  const result = await execPromise(`"${adb}" connect "${target}"`)
+  const output = `${result.stdout}\n${result.stderr}`.trim()
+  const ok = /connected to|already connected to/i.test(output)
+  return {
+    ok,
+    target,
+    message: output || (ok ? `connected to ${target}` : `failed to connect to ${target}`)
+  }
+}
+
+async function connectLanPeersThroughAdb(
+  adb: string,
+  currentSerials: Set<string>
+): Promise<number> {
+  const candidates = collectLanAdbConnectTargets(currentSerials).filter((target) =>
+    shouldTryAdbConnect(target)
+  )
+  if (candidates.length === 0) return 0
+
+  const attempts = await Promise.all(candidates.map((target) => connectAdbTarget(adb, target)))
+  const failed = attempts.filter((item) => !item.ok)
+  if (failed.length > 0) {
+    debugState.lastError = failed[failed.length - 1].message
+  }
+  return attempts.filter((item) => item.ok).length
 }
 
 function parseResolution(raw: string): { width: number; height: number } {
@@ -465,11 +561,22 @@ async function refreshAdbDevices(): Promise<void> {
     return
   }
 
-  const result = await execPromise(`"${adb}" devices -l`)
+  await execPromise(`"${adb}" start-server`)
+  let result = await execPromise(`"${adb}" devices -l`)
   debugState.lastArpReadAt = Date.now()
   debugState.lastError = result.ok ? '' : result.stderr || 'adb devices failed'
 
-  const serials = parseAdbSerials(result.stdout)
+  let serials = parseAdbSerials(result.stdout)
+  const connectedCount = await connectLanPeersThroughAdb(adb, new Set(serials))
+  if (connectedCount > 0) {
+    const refreshedResult = await execPromise(`"${adb}" devices -l`)
+    if (refreshedResult.ok || !result.ok) {
+      result = refreshedResult
+      debugState.lastError = result.ok ? '' : result.stderr || 'adb devices failed'
+      serials = parseAdbSerials(result.stdout)
+    }
+  }
+
   debugState.lastArpNeighborCount = serials.length
   debugState.lastArpNeighbors = serials
   if (serials.length > 0) {
@@ -785,6 +892,21 @@ app.whenReady().then(() => {
 
   ipcMain.handle('lan:get-pairing-info', () => {
     return getPairingInfo()
+  })
+
+  ipcMain.handle('lan:adb-connect', async (_event, target: string) => {
+    const adb = await resolveAdbCommand()
+    if (!adb) {
+      return {
+        ok: false,
+        target,
+        message: 'adb 不可用，请先安装 Android Platform Tools 或将 adb 加入 PATH'
+      }
+    }
+    await execPromise(`"${adb}" start-server`)
+    const result = await connectAdbTarget(adb, target)
+    await refreshAdbDevices()
+    return result
   })
 
   startUdpDiscovery()

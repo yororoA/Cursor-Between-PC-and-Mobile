@@ -44,12 +44,34 @@ type PairingInfo = {
   urls: string[]
 }
 
+type AdbConnectResult = {
+  ok: boolean
+  target: string
+  message: string
+}
+
 type CompareLayout = {
   localPhysical: ReturnType<typeof toPhysical>
   remotePhysical: ReturnType<typeof toPhysical>
   localRect: { width: number; height: number }
   remoteRect: { width: number; height: number }
   pxPerMm: number
+}
+
+type RectByCenter = {
+  left: number
+  right: number
+  top: number
+  bottom: number
+  width: number
+  height: number
+}
+
+type ConnectionSnapshot = {
+  confirmedAt: number
+  localOffset: { x: number; y: number }
+  remoteOffset: { x: number; y: number }
+  overlapAreaPx: number
 }
 
 const LIST_HEIGHT = 420
@@ -141,6 +163,35 @@ function snapAxis(remoteCenter: number, remoteHalf: number, localHalf: number, t
   }
 }
 
+function rectFromCenter(centerX: number, centerY: number, width: number, height: number): RectByCenter {
+  const halfW = width / 2
+  const halfH = height / 2
+  return {
+    left: centerX - halfW,
+    right: centerX + halfW,
+    top: centerY - halfH,
+    bottom: centerY + halfH,
+    width,
+    height
+  }
+}
+
+function getOverlapRect(a: RectByCenter, b: RectByCenter): RectByCenter | null {
+  const left = Math.max(a.left, b.left)
+  const right = Math.min(a.right, b.right)
+  const top = Math.max(a.top, b.top)
+  const bottom = Math.min(a.bottom, b.bottom)
+  if (right <= left || bottom <= top) return null
+  return {
+    left,
+    right,
+    top,
+    bottom,
+    width: right - left,
+    height: bottom - top
+  }
+}
+
 function App(): React.JSX.Element {
   const [devices, setDevices] = useState<DeviceInfo[]>([])
   const [query, setQuery] = useState('')
@@ -153,6 +204,10 @@ function App(): React.JSX.Element {
   const [debugInfo, setDebugInfo] = useState<DiscoveryDebugInfo | null>(null)
   const [pairingInfo, setPairingInfo] = useState<PairingInfo | null>(null)
   const [pairQrDataUrl, setPairQrDataUrl] = useState('')
+  const [adbConnectTarget, setAdbConnectTarget] = useState('')
+  const [adbConnectResult, setAdbConnectResult] = useState<AdbConnectResult | null>(null)
+  const [adbConnecting, setAdbConnecting] = useState(false)
+  const [connectionSnapshot, setConnectionSnapshot] = useState<ConnectionSnapshot | null>(null)
   const [snapGuides, setSnapGuides] = useState<{ x: number | null; y: number | null }>({ x: null, y: null })
   const [stageSize, setStageSize] = useState({ width: 900, height: 540 })
   const stageRef = useRef<HTMLElement | null>(null)
@@ -361,6 +416,8 @@ function App(): React.JSX.Element {
       }
 
       setCompare({ local, remote })
+      setConnectionSnapshot(null)
+      setDragOffset({ x: 260, y: 20 })
     } catch {
       setError('获取设备分辨率和 DPI 失败')
     } finally {
@@ -383,6 +440,30 @@ function App(): React.JSX.Element {
     }
   }
 
+  async function handleAdbConnect(): Promise<void> {
+    if (!adbConnectTarget.trim()) {
+      setAdbConnectResult({
+        ok: false,
+        target: '',
+        message: '请输入手机的局域网地址，例如 192.168.1.23 或 192.168.1.23:5555'
+      })
+      return
+    }
+
+    setAdbConnecting(true)
+    setAdbConnectResult(null)
+    try {
+      const result = await window.api.adbConnect(adbConnectTarget)
+      setAdbConnectResult(result)
+      const latest = await window.api.getDevices()
+      setDevices(latest)
+    } catch {
+      setAdbConnectResult({ ok: false, target: adbConnectTarget, message: '执行 adb connect 失败' })
+    } finally {
+      setAdbConnecting(false)
+    }
+  }
+
   function startDrag(event: React.PointerEvent<HTMLDivElement>): void {
     dragStateRef.current = {
       active: true,
@@ -395,6 +476,20 @@ function App(): React.JSX.Element {
     event.currentTarget.setPointerCapture(event.pointerId)
   }
 
+  function handleConfirmConnection(overlapAreaPx: number): void {
+    setConnectionSnapshot({
+      confirmedAt: Date.now(),
+      localOffset: { x: 0, y: 0 },
+      remoteOffset: { ...dragOffset },
+      overlapAreaPx
+    })
+  }
+
+  function handleExitCompare(): void {
+    setCompare(null)
+    setConnectionSnapshot(null)
+  }
+
   if (compare) {
     if (!compareLayout) return <main className="app-shell" />
 
@@ -402,6 +497,22 @@ function App(): React.JSX.Element {
     const remotePhysical = compareLayout.remotePhysical
     const localRect = compareLayout.localRect
     const remoteRect = compareLayout.remoteRect
+    const localBounds = rectFromCenter(0, 0, localRect.width, localRect.height)
+    const remoteBounds = rectFromCenter(dragOffset.x, dragOffset.y, remoteRect.width, remoteRect.height)
+    const overlapRect = getOverlapRect(localBounds, remoteBounds)
+    const sourceRect = localBounds
+    const projectionEnabled = Boolean(connectionSnapshot && overlapRect)
+    const overlapAreaPx = overlapRect ? Math.round(overlapRect.width * overlapRect.height) : 0
+    const projectionStyle = projectionEnabled && overlapRect
+      ? {
+          left: `calc(50% + ${overlapRect.left}px)`,
+          top: `calc(50% + ${overlapRect.top}px)`,
+          width: `${overlapRect.width}px`,
+          height: `${overlapRect.height}px`,
+          backgroundSize: `${sourceRect.width}px ${sourceRect.height}px`,
+          backgroundPosition: `${-(overlapRect.left - sourceRect.left)}px ${-(overlapRect.top - sourceRect.top)}px`
+        }
+      : null
     const rulerExtentX = Math.floor(stageSize.width / (2 * compareLayout.pxPerMm))
     const rulerExtentY = Math.floor(stageSize.height / (2 * compareLayout.pxPerMm))
     const rulerStepMm = 10
@@ -418,11 +529,23 @@ function App(): React.JSX.Element {
     return (
       <main className="app-shell compare-shell">
         <header className="topbar">
-          <button className="secondary-btn" onClick={() => setCompare(null)}>
+          <button className="secondary-btn" onClick={handleExitCompare}>
             返回设备列表
           </button>
-          <p className="hint">拖拽右侧设备图进行位置微调</p>
+          <div className="compare-actions">
+            <button className="refresh-btn" type="button" onClick={() => handleConfirmConnection(overlapAreaPx)}>
+              确认连接
+            </button>
+            <p className="hint">拖拽右侧设备图进行位置微调</p>
+          </div>
         </header>
+
+        {connectionSnapshot ? (
+          <p className="snapshot-line">
+            快照时间: {toTimeLabel(connectionSnapshot.confirmedAt)} | 远端偏移: ({Math.round(connectionSnapshot.remoteOffset.x)},{' '}
+            {Math.round(connectionSnapshot.remoteOffset.y)}) | 重叠面积: {overlapAreaPx}px^2
+          </p>
+        ) : null}
 
         <section className="stage" ref={stageRef}>
           <div className="ruler ruler-x">
@@ -451,6 +574,12 @@ function App(): React.JSX.Element {
 
           {snapGuides.x !== null ? <div className="snap-line vertical" style={{ left: `calc(50% + ${snapGuides.x}px)` }} /> : null}
           {snapGuides.y !== null ? <div className="snap-line horizontal" style={{ top: `calc(50% + ${snapGuides.y}px)` }} /> : null}
+
+          {projectionStyle ? (
+            <div className="projection-overlay" style={projectionStyle}>
+              <span>实时投映</span>
+            </div>
+          ) : null}
 
           <div className="device-rect local" style={{ width: localRect.width, height: localRect.height }}>
             <h3>{compare.local.name} (本机)</h3>
@@ -513,6 +642,25 @@ function App(): React.JSX.Element {
           <p className="pair-line">1) 手机开启开发者选项与 USB 调试。</p>
           <p className="pair-line">2) USB 连接后，在手机上点击“允许 USB 调试”。</p>
           <p className="pair-line">3) 如需无线调试，请先 USB 配对后执行 adb tcpip / adb connect。</p>
+          <div className="adb-connect-row">
+            <input
+              className="search-input adb-connect-input"
+              value={adbConnectTarget}
+              onChange={(event) => setAdbConnectTarget(event.target.value)}
+              placeholder="手动 adb connect (示例: 192.168.1.23:5555)"
+            />
+            <button
+              type="button"
+              className="refresh-btn"
+              onClick={() => void handleAdbConnect()}
+              disabled={adbConnecting}
+            >
+              {adbConnecting ? '连接中...' : 'ADB连接'}
+            </button>
+          </div>
+          {adbConnectResult ? (
+            <p className={adbConnectResult.ok ? 'debug-line' : 'debug-error'}>ADB连接结果: {adbConnectResult.message}</p>
+          ) : null}
         </section>
 
         <div className="search-row">

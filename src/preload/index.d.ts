@@ -38,6 +38,12 @@ type PairingInfo = {
   urls: string[]
 }
 
+type AdbConnectResult = {
+  ok: boolean
+  target: string
+  message: string
+}
+
 type AppApi = {
   getDevices: () => Promise<DeviceInfo[]>
   getLocalDevice: () => Promise<DeviceInfo>
@@ -45,6 +51,7 @@ type AppApi = {
   refreshDiscovery: () => Promise<boolean>
   getDiscoveryDebug: () => Promise<DiscoveryDebugInfo>
   getPairingInfo: () => Promise<PairingInfo>
+  adbConnect: (target: string) => Promise<AdbConnectResult>
   onDevicesUpdated: (callback: (devices: DeviceInfo[]) => void) => () => void
 }
 

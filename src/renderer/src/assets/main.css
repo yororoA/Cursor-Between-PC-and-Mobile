@@ -102,6 +102,18 @@ body {
   padding: 6px;
 }
 
+.adb-connect-row {
+  margin-top: 8px;
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 8px;
+}
+
+.adb-connect-input {
+  min-width: 240px;
+  font-size: 14px;
+}
+
 .search-row {
   display: grid;
   grid-template-columns: 1fr auto;
@@ -238,6 +250,22 @@ body {
   margin: 0;
 }
 
+.compare-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.snapshot-line {
+  margin: 0 0 8px;
+  padding: 8px 10px;
+  border-radius: 10px;
+  font-size: 12px;
+  color: #ffe6b0;
+  border: 1px solid rgba(255, 214, 134, 0.35);
+  background: rgba(255, 190, 90, 0.12);
+}
+
 .stage {
   position: relative;
   width: 100%;
@@ -337,6 +365,42 @@ body {
   background: linear-gradient(90deg, rgba(255, 215, 127, 0.15), rgba(255, 215, 127, 0.95), rgba(255, 215, 127, 0.15));
 }
 
+.projection-overlay {
+  position: absolute;
+  z-index: 6;
+  pointer-events: none;
+  border: 1px solid rgba(143, 241, 255, 0.7);
+  box-shadow: 0 0 12px rgba(121, 226, 255, 0.65), inset 0 0 20px rgba(104, 234, 255, 0.24);
+  background-color: rgba(15, 28, 42, 0.88);
+  background-image:
+    radial-gradient(circle at 20% 22%, rgba(117, 247, 215, 0.4), transparent 40%),
+    linear-gradient(105deg, rgba(68, 205, 255, 0.55), rgba(39, 116, 210, 0.35) 58%, rgba(131, 255, 237, 0.55)),
+    repeating-linear-gradient(0deg, rgba(255, 255, 255, 0.09) 0, rgba(255, 255, 255, 0.09) 2px, rgba(16, 29, 44, 0.02) 2px, rgba(16, 29, 44, 0.02) 5px);
+  mix-blend-mode: screen;
+  overflow: hidden;
+  animation: projection-pulse 1.4s ease-in-out infinite;
+}
+
+.projection-overlay::before {
+  content: '';
+  position: absolute;
+  left: -20%;
+  right: -20%;
+  top: -35%;
+  height: 40%;
+  background: linear-gradient(180deg, rgba(181, 252, 255, 0.4), rgba(181, 252, 255, 0));
+  animation: projection-scan 2.1s linear infinite;
+}
+
+.projection-overlay span {
+  position: absolute;
+  right: 6px;
+  bottom: 4px;
+  font-size: 10px;
+  letter-spacing: 0.3px;
+  color: rgba(218, 252, 255, 0.92);
+}
+
 .device-rect {
   position: absolute;
   z-index: 3;
@@ -399,6 +463,25 @@ body {
   }
 }
 
+@keyframes projection-scan {
+  from {
+    transform: translateY(-12%);
+  }
+  to {
+    transform: translateY(310%);
+  }
+}
+
+@keyframes projection-pulse {
+  0%,
+  100% {
+    filter: saturate(0.95) brightness(0.95);
+  }
+  50% {
+    filter: saturate(1.2) brightness(1.08);
+  }
+}
+
 @media (max-width: 860px) {
   .app-shell {
     width: calc(100vw - 18px);
@@ -410,11 +493,20 @@ body {
     align-items: flex-start;
   }
 
+  .compare-actions {
+    width: 100%;
+    flex-wrap: wrap;
+  }
+
   .compare-shell {
     height: calc(100vh - 18px);
   }
 
   .search-row {
+    grid-template-columns: 1fr;
+  }
+
+  .adb-connect-row {
     grid-template-columns: 1fr;
   }
 }

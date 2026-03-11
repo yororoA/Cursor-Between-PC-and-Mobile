@@ -9,6 +9,7 @@ const api = {
   refreshDiscovery: () => ipcRenderer.invoke('lan:refresh-discovery'),
   getDiscoveryDebug: () => ipcRenderer.invoke('lan:get-discovery-debug'),
   getPairingInfo: () => ipcRenderer.invoke('lan:get-pairing-info'),
+  adbConnect: (target: string) => ipcRenderer.invoke('lan:adb-connect', target),
   onDevicesUpdated: (callback: (devices: unknown[]) => void) => {
     const listener = (_event: unknown, devices: unknown[]): void => callback(devices)
     ipcRenderer.on('lan:devices-updated', listener)
