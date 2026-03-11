@@ -74,6 +74,28 @@ type ConnectionSnapshot = {
   overlapAreaPx: number
 }
 
+type PixelCrop = {
+  x: number
+  y: number
+  width: number
+  height: number
+}
+
+type ProjectionStatus = {
+  sessionId: string
+  targetDeviceId: string
+  targetClientId: string
+  active: boolean
+  streamOnline: boolean
+  lastFrameId: number
+  lastSentAt: number
+  lastAckFrameId: number
+  lastAckAt: number
+  waitingAck: boolean
+  status: 'idle' | 'waiting-ack' | 'receiving' | 'ack-timeout' | 'offline' | 'stopped'
+  lastMessage: string
+}
+
 const LIST_HEIGHT = 420
 const ROW_HEIGHT = 62
 const OVERSCAN = 6
@@ -192,6 +214,29 @@ function getOverlapRect(a: RectByCenter, b: RectByCenter): RectByCenter | null {
   }
 }
 
+function mapStageOverlapToLocalScreenPixels(
+  overlapRect: RectByCenter,
+  localBounds: RectByCenter,
+  localResolution: { width: number; height: number }
+): PixelCrop {
+  const relLeft = (overlapRect.left - localBounds.left) / localBounds.width
+  const relTop = (overlapRect.top - localBounds.top) / localBounds.height
+  const relWidth = overlapRect.width / localBounds.width
+  const relHeight = overlapRect.height / localBounds.height
+
+  const pxLeft = Math.max(0, Math.round(relLeft * localResolution.width))
+  const pxTop = Math.max(0, Math.round(relTop * localResolution.height))
+  const pxWidth = Math.max(1, Math.round(relWidth * localResolution.width))
+  const pxHeight = Math.max(1, Math.round(relHeight * localResolution.height))
+
+  return {
+    x: Math.min(localResolution.width - 1, pxLeft),
+    y: Math.min(localResolution.height - 1, pxTop),
+    width: Math.min(localResolution.width - pxLeft, pxWidth),
+    height: Math.min(localResolution.height - pxTop, pxHeight)
+  }
+}
+
 function App(): React.JSX.Element {
   const [devices, setDevices] = useState<DeviceInfo[]>([])
   const [query, setQuery] = useState('')
@@ -208,9 +253,17 @@ function App(): React.JSX.Element {
   const [adbConnectResult, setAdbConnectResult] = useState<AdbConnectResult | null>(null)
   const [adbConnecting, setAdbConnecting] = useState(false)
   const [connectionSnapshot, setConnectionSnapshot] = useState<ConnectionSnapshot | null>(null)
+  const [projectionSessionId, setProjectionSessionId] = useState('')
+  const [projectionStatus, setProjectionStatus] = useState<ProjectionStatus | null>(null)
+  const [projectionStatusText, setProjectionStatusText] = useState('未建立投映会话')
   const [snapGuides, setSnapGuides] = useState<{ x: number | null; y: number | null }>({ x: null, y: null })
   const [stageSize, setStageSize] = useState({ width: 900, height: 540 })
+  const [screenCaptureReady, setScreenCaptureReady] = useState(false)
   const stageRef = useRef<HTMLElement | null>(null)
+  const captureStreamRef = useRef<MediaStream | null>(null)
+  const captureVideoRef = useRef<HTMLVideoElement | null>(null)
+  const captureCanvasRef = useRef<HTMLCanvasElement | null>(null)
+  const cropCanvasRef = useRef<HTMLCanvasElement | null>(null)
   const dragStateRef = useRef<{ active: boolean; startX: number; startY: number; x: number; y: number }>({
     active: false,
     startX: 0,
@@ -269,6 +322,106 @@ function App(): React.JSX.Element {
       dispose()
     }
   }, [])
+
+  useEffect(() => {
+    const dispose = window.api.onProjectionStatus((payload) => {
+      setProjectionStatus(payload)
+      setProjectionStatusText(payload.lastMessage || payload.status)
+    })
+    return () => {
+      dispose()
+    }
+  }, [])
+
+  useEffect(() => {
+    return () => {
+      if (projectionSessionId) {
+        void window.api.projectionStop(projectionSessionId)
+      }
+      const stream = captureStreamRef.current
+      if (stream) {
+        for (const track of stream.getTracks()) {
+          track.stop()
+        }
+      }
+    }
+  }, [projectionSessionId])
+
+  async function ensureScreenCaptureReady(): Promise<boolean> {
+    if (captureStreamRef.current && captureVideoRef.current?.readyState >= 2) {
+      return true
+    }
+
+    try {
+      const stream = await navigator.mediaDevices.getDisplayMedia({
+        video: {
+          frameRate: { ideal: 12, max: 15 }
+        },
+        audio: false
+      })
+
+      const video = document.createElement('video')
+      video.srcObject = stream
+      video.muted = true
+      video.playsInline = true
+      await video.play()
+
+      captureStreamRef.current = stream
+      captureVideoRef.current = video
+      setScreenCaptureReady(true)
+      return true
+    } catch {
+      setScreenCaptureReady(false)
+      setProjectionStatusText('未获得整屏采集权限，请在弹窗中选择“整个屏幕”')
+      return false
+    }
+  }
+
+  function captureCropFromFullScreen(
+    crop: PixelCrop,
+    localResolution: { width: number; height: number }
+  ): string {
+    const video = captureVideoRef.current
+    if (!video || video.readyState < 2) return ''
+
+    const sourceW = video.videoWidth
+    const sourceH = video.videoHeight
+    if (!sourceW || !sourceH) return ''
+
+    const fullCanvas = captureCanvasRef.current || document.createElement('canvas')
+    fullCanvas.width = sourceW
+    fullCanvas.height = sourceH
+    captureCanvasRef.current = fullCanvas
+
+    const fullCtx = fullCanvas.getContext('2d')
+    if (!fullCtx) return ''
+    fullCtx.drawImage(video, 0, 0, sourceW, sourceH)
+
+    const scaleX = sourceW / Math.max(1, localResolution.width)
+    const scaleY = sourceH / Math.max(1, localResolution.height)
+
+    const scaledX = Math.round(crop.x * scaleX)
+    const scaledY = Math.round(crop.y * scaleY)
+    const scaledWidth = Math.max(1, Math.round(crop.width * scaleX))
+    const scaledHeight = Math.max(1, Math.round(crop.height * scaleY))
+
+    const cropX = Math.max(0, Math.min(sourceW - 1, scaledX))
+    const cropY = Math.max(0, Math.min(sourceH - 1, scaledY))
+    const cropWidth = Math.max(1, Math.min(sourceW - cropX, scaledWidth))
+    const cropHeight = Math.max(1, Math.min(sourceH - cropY, scaledHeight))
+
+    const cropCanvas = cropCanvasRef.current || document.createElement('canvas')
+    cropCanvas.width = cropWidth
+    cropCanvas.height = cropHeight
+    cropCanvasRef.current = cropCanvas
+
+    const cropCtx = cropCanvas.getContext('2d')
+    if (!cropCtx) return ''
+    cropCtx.clearRect(0, 0, cropWidth, cropHeight)
+    cropCtx.drawImage(fullCanvas, cropX, cropY, cropWidth, cropHeight, 0, 0, cropWidth, cropHeight)
+
+    return cropCanvas.toDataURL('image/jpeg', 0.78)
+  }
 
   useEffect(() => {
     const stage = stageRef.current
@@ -405,6 +558,9 @@ function App(): React.JSX.Element {
     setLoadingId(device.id)
 
     try {
+      if (projectionSessionId) {
+        await window.api.projectionStop(projectionSessionId)
+      }
       const [local, remote] = await Promise.all([
         window.api.getLocalDevice(),
         window.api.requestDeviceInfo(device.id)
@@ -418,6 +574,9 @@ function App(): React.JSX.Element {
       setCompare({ local, remote })
       setConnectionSnapshot(null)
       setDragOffset({ x: 260, y: 20 })
+      setProjectionSessionId('')
+      setProjectionStatus(null)
+      setProjectionStatusText('未建立投映会话')
     } catch {
       setError('获取设备分辨率和 DPI 失败')
     } finally {
@@ -465,6 +624,7 @@ function App(): React.JSX.Element {
   }
 
   function startDrag(event: React.PointerEvent<HTMLDivElement>): void {
+    if (connectionSnapshot) return
     dragStateRef.current = {
       active: true,
       startX: event.clientX,
@@ -476,19 +636,88 @@ function App(): React.JSX.Element {
     event.currentTarget.setPointerCapture(event.pointerId)
   }
 
-  function handleConfirmConnection(overlapAreaPx: number): void {
+  async function handleConfirmConnection(overlapAreaPx: number): Promise<void> {
+    if (!compare) return
+    if (overlapAreaPx <= 0) {
+      setProjectionStatusText('当前无重叠区域，无法建立遮挡投映')
+      return
+    }
+    const captureReady = await ensureScreenCaptureReady()
+    if (!captureReady) return
+
+    if (!projectionSessionId) {
+      const started = await window.api.projectionStart(compare.remote.id)
+      if (!started.ok) {
+        setProjectionStatusText(started.message)
+        setError(started.message)
+        return
+      }
+      setProjectionSessionId(started.sessionId)
+      setProjectionStatusText(started.message)
+    }
+
     setConnectionSnapshot({
       confirmedAt: Date.now(),
       localOffset: { x: 0, y: 0 },
       remoteOffset: { ...dragOffset },
       overlapAreaPx
     })
+    setProjectionStatusText('已锁定快照坐标，开始整屏对齐投映')
   }
 
-  function handleExitCompare(): void {
+  async function handleExitCompare(): Promise<void> {
+    if (projectionSessionId) {
+      await window.api.projectionStop(projectionSessionId)
+    }
     setCompare(null)
     setConnectionSnapshot(null)
+    setProjectionSessionId('')
+    setProjectionStatus(null)
+    setProjectionStatusText('未建立投映会话')
   }
+
+  useEffect(() => {
+    if (!compare || !compareLayout || !connectionSnapshot || !projectionSessionId) return
+
+    const timer = window.setInterval(() => {
+      const localBounds = rectFromCenter(
+        connectionSnapshot.localOffset.x,
+        connectionSnapshot.localOffset.y,
+        compareLayout.localRect.width,
+        compareLayout.localRect.height
+      )
+      const remoteBounds = rectFromCenter(
+        connectionSnapshot.remoteOffset.x,
+        connectionSnapshot.remoteOffset.y,
+        compareLayout.remoteRect.width,
+        compareLayout.remoteRect.height
+      )
+      const overlapRect = getOverlapRect(localBounds, remoteBounds)
+      if (!overlapRect) return
+
+      const crop = mapStageOverlapToLocalScreenPixels(
+        overlapRect,
+        localBounds,
+        compare.local.resolution
+      )
+      const imageDataUrl = captureCropFromFullScreen(crop, compare.local.resolution)
+      if (!imageDataUrl) return
+
+      void window.api.projectionPush(projectionSessionId, {
+        imageDataUrl,
+        overlap: {
+          width: crop.width,
+          height: crop.height,
+          left: crop.x,
+          top: crop.y
+        }
+      })
+    }, 320)
+
+    return () => {
+      window.clearInterval(timer)
+    }
+  }, [compare, compareLayout, connectionSnapshot, projectionSessionId])
 
   if (compare) {
     if (!compareLayout) return <main className="app-shell" />
@@ -497,8 +726,20 @@ function App(): React.JSX.Element {
     const remotePhysical = compareLayout.remotePhysical
     const localRect = compareLayout.localRect
     const remoteRect = compareLayout.remoteRect
-    const localBounds = rectFromCenter(0, 0, localRect.width, localRect.height)
-    const remoteBounds = rectFromCenter(dragOffset.x, dragOffset.y, remoteRect.width, remoteRect.height)
+    const activeLocalOffset = connectionSnapshot?.localOffset || { x: 0, y: 0 }
+    const activeRemoteOffset = connectionSnapshot?.remoteOffset || dragOffset
+    const localBounds = rectFromCenter(
+      activeLocalOffset.x,
+      activeLocalOffset.y,
+      localRect.width,
+      localRect.height
+    )
+    const remoteBounds = rectFromCenter(
+      activeRemoteOffset.x,
+      activeRemoteOffset.y,
+      remoteRect.width,
+      remoteRect.height
+    )
     const overlapRect = getOverlapRect(localBounds, remoteBounds)
     const sourceRect = localBounds
     const projectionEnabled = Boolean(connectionSnapshot && overlapRect)
@@ -529,11 +770,11 @@ function App(): React.JSX.Element {
     return (
       <main className="app-shell compare-shell">
         <header className="topbar">
-          <button className="secondary-btn" onClick={handleExitCompare}>
+          <button className="secondary-btn" onClick={() => void handleExitCompare()}>
             返回设备列表
           </button>
           <div className="compare-actions">
-            <button className="refresh-btn" type="button" onClick={() => handleConfirmConnection(overlapAreaPx)}>
+            <button className="refresh-btn" type="button" onClick={() => void handleConfirmConnection(overlapAreaPx)}>
               确认连接
             </button>
             <p className="hint">拖拽右侧设备图进行位置微调</p>
@@ -546,6 +787,15 @@ function App(): React.JSX.Element {
             {Math.round(connectionSnapshot.remoteOffset.y)}) | 重叠面积: {overlapAreaPx}px^2
           </p>
         ) : null}
+
+        <p className="snapshot-line">
+          投映状态: {projectionStatusText} | 通道: {projectionStatus?.streamOnline ? '在线' : '离线'} | ACK: #
+          {projectionStatus?.lastAckFrameId ?? 0}
+        </p>
+
+        <p className="snapshot-line">
+          整屏采集: {screenCaptureReady ? '已就绪' : '未就绪（确认连接时会请求权限）'}
+        </p>
 
         <section className="stage" ref={stageRef}>
           <div className="ruler ruler-x">
@@ -594,7 +844,12 @@ function App(): React.JSX.Element {
 
           <div
             className="device-rect remote"
-            style={{ width: remoteRect.width, height: remoteRect.height, left: `calc(50% + ${dragOffset.x}px)`, top: `calc(50% + ${dragOffset.y}px)` }}
+            style={{
+              width: remoteRect.width,
+              height: remoteRect.height,
+              left: `calc(50% + ${activeRemoteOffset.x}px)`,
+              top: `calc(50% + ${activeRemoteOffset.y}px)`
+            }}
             onPointerDown={startDrag}
           >
             <h3>{compare.remote.name}</h3>

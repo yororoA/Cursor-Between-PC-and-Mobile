@@ -44,6 +44,45 @@ type AdbConnectResult = {
   message: string
 }
 
+type ProjectionStartResult = {
+  ok: boolean
+  sessionId: string
+  targetDeviceId: string
+  message: string
+}
+
+type ProjectionPushPayload = {
+  imageDataUrl: string
+  overlap: {
+    width: number
+    height: number
+    left: number
+    top: number
+  }
+}
+
+type ProjectionPushResult = {
+  ok: boolean
+  sessionId: string
+  frameId: number
+  message: string
+}
+
+type ProjectionStatus = {
+  sessionId: string
+  targetDeviceId: string
+  targetClientId: string
+  active: boolean
+  streamOnline: boolean
+  lastFrameId: number
+  lastSentAt: number
+  lastAckFrameId: number
+  lastAckAt: number
+  waitingAck: boolean
+  status: 'idle' | 'waiting-ack' | 'receiving' | 'ack-timeout' | 'offline' | 'stopped'
+  lastMessage: string
+}
+
 type AppApi = {
   getDevices: () => Promise<DeviceInfo[]>
   getLocalDevice: () => Promise<DeviceInfo>
@@ -52,7 +91,12 @@ type AppApi = {
   getDiscoveryDebug: () => Promise<DiscoveryDebugInfo>
   getPairingInfo: () => Promise<PairingInfo>
   adbConnect: (target: string) => Promise<AdbConnectResult>
+  projectionStart: (targetDeviceId: string) => Promise<ProjectionStartResult>
+  projectionPush: (sessionId: string, payload: ProjectionPushPayload) => Promise<ProjectionPushResult>
+  projectionStop: (sessionId: string) => Promise<boolean>
+  projectionStatus: (sessionId: string) => Promise<ProjectionStatus | null>
   onDevicesUpdated: (callback: (devices: DeviceInfo[]) => void) => () => void
+  onProjectionStatus: (callback: (payload: ProjectionStatus) => void) => () => void
 }
 
 declare global {

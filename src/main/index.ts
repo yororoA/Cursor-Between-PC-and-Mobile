@@ -56,6 +56,67 @@ type BrowserHelloPayload = {
   userAgent?: string
 }
 
+type ProjectionStartResult = {
+  ok: boolean
+  sessionId: string
+  targetDeviceId: string
+  message: string
+}
+
+type ProjectionPushResult = {
+  ok: boolean
+  sessionId: string
+  frameId: number
+  message: string
+}
+
+type ProjectionStatusSnapshot = {
+  sessionId: string
+  targetDeviceId: string
+  targetClientId: string
+  active: boolean
+  streamOnline: boolean
+  lastFrameId: number
+  lastSentAt: number
+  lastAckFrameId: number
+  lastAckAt: number
+  waitingAck: boolean
+  status: 'idle' | 'waiting-ack' | 'receiving' | 'ack-timeout' | 'offline' | 'stopped'
+  lastMessage: string
+}
+
+type ProjectionPushPayload = {
+  imageDataUrl: string
+  overlap: {
+    width: number
+    height: number
+    left: number
+    top: number
+  }
+}
+
+type ProjectionAckPayload = {
+  clientId?: string
+  sessionId?: string
+  frameId?: number
+  renderedAt?: number
+}
+
+type ProjectionSession = {
+  sessionId: string
+  targetDeviceId: string
+  targetClientId: string
+  active: boolean
+  lastFrameId: number
+  lastSentAt: number
+  lastAckFrameId: number
+  lastAckAt: number
+  waitingAckFrameId: number
+  ackTimer: NodeJS.Timeout | null
+  status: ProjectionStatusSnapshot['status']
+  lastMessage: string
+}
+
 type WireMessage =
   | { type: 'announce'; payload: DeviceRecord }
   | { type: 'query-info'; payload: { requesterId: string; targetId: string; requestId: string } }
@@ -77,6 +138,7 @@ const DISCOVERY_SWEEP_INTERVAL_MS = 12_000
 const PEER_TTL_MS = 10_000
 const WEB_PEER_PREFIX = 'web:'
 const WEB_PEER_TTL_MS = 20_000
+const PROJECTION_ACK_TIMEOUT_MS = 2_000
 
 const localDeviceId = randomUUID()
 const localDeviceName = os.hostname()
@@ -94,6 +156,8 @@ const adbPeers = new Map<string, DeviceRecord>()
 const webPeers = new Map<string, DeviceRecord>()
 const pendingRequests = new Map<string, (device: DeviceRecord) => void>()
 const adbConnectCooldown = new Map<string, number>()
+const projectionStreams = new Map<string, ServerResponse>()
+const projectionSessions = new Map<string, ProjectionSession>()
 
 const debugState: DiscoveryDebugSnapshot = {
   startedAt: Date.now(),
@@ -210,20 +274,30 @@ function createPairPageHtml(): string {
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Device Bridge Pair</title>
   <style>
-    body { font-family: -apple-system, BlinkMacSystemFont, Segoe UI, Roboto, sans-serif; margin: 0; padding: 20px; background: #0f1720; color: #f3f6fa; }
-    .card { max-width: 560px; margin: 0 auto; border: 1px solid #2a3a4c; border-radius: 14px; padding: 16px; background: #152231; }
+    body { font-family: -apple-system, BlinkMacSystemFont, Segoe UI, Roboto, sans-serif; margin: 0; padding: 16px; background: #0f1720; color: #f3f6fa; }
+    .card { max-width: 680px; margin: 0 auto; border: 1px solid #2a3a4c; border-radius: 14px; padding: 16px; background: #152231; }
     h1 { margin: 0 0 10px; font-size: 22px; }
     p { margin: 8px 0; color: #d3deea; }
     .ok { color: #7ce0ab; }
+    .warn { color: #ffd17a; }
+    .bad { color: #ff9a9a; }
     .meta { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12px; color: #9fc0dc; word-break: break-all; }
+    .screen { margin-top: 12px; border: 1px solid #385472; border-radius: 12px; overflow: hidden; background: #08121d; }
+    .screen img { display: block; width: 100%; min-height: 180px; object-fit: cover; background: #0a1624; }
+    .screen .caption { padding: 8px 10px; font-size: 12px; color: #b8d4ec; border-top: 1px solid #2a3a4c; }
   </style>
 </head>
 <body>
   <div class="card">
     <h1>Phone Connected</h1>
-    <p>Keep this page open. This phone will appear in the desktop app device list.</p>
+    <p>Keep this page open in foreground. It receives real-time projection frames from desktop.</p>
     <p id="status" class="ok">Connecting...</p>
+    <p id="stream" class="warn">Projection stream: waiting...</p>
     <p id="meta" class="meta"></p>
+    <div class="screen">
+      <img id="projection" alt="Projection Frame" />
+      <div id="caption" class="caption">No projection frame yet</div>
+    </div>
   </div>
   <script>
     const key = 'bridge-client-id';
@@ -234,7 +308,56 @@ function createPairPageHtml(): string {
     }
 
     const statusEl = document.getElementById('status');
+    const streamEl = document.getElementById('stream');
     const metaEl = document.getElementById('meta');
+    const projectionEl = document.getElementById('projection');
+    const captionEl = document.getElementById('caption');
+    let source = null;
+
+    function postAck(sessionId, frameId) {
+      return fetch('/api/projection/ack', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          clientId,
+          sessionId,
+          frameId,
+          renderedAt: Date.now()
+        })
+      });
+    }
+
+    function openProjectionStream() {
+      if (source) {
+        source.close();
+      }
+      source = new EventSource('/api/projection/stream?clientId=' + encodeURIComponent(clientId));
+      source.onopen = function () {
+        streamEl.className = 'ok';
+        streamEl.textContent = 'Projection stream: online';
+      };
+      source.onerror = function () {
+        streamEl.className = 'bad';
+        streamEl.textContent = 'Projection stream: disconnected, retrying...';
+      };
+
+      source.addEventListener('projection-frame', async function (event) {
+        try {
+          const data = JSON.parse(event.data || '{}');
+          const sessionId = data.sessionId || '';
+          const frameId = Number(data.frameId || 0);
+          const imageDataUrl = data.imageDataUrl || '';
+
+          if (imageDataUrl) {
+            projectionEl.src = imageDataUrl;
+            captionEl.textContent = 'Session ' + sessionId.slice(0, 8) + ' frame #' + frameId;
+          }
+          await postAck(sessionId, frameId);
+        } catch (error) {
+          captionEl.textContent = 'Frame parse error';
+        }
+      });
+    }
 
     async function ping() {
       const payload = {
@@ -254,6 +377,9 @@ function createPairPageHtml(): string {
           body: JSON.stringify(payload)
         });
         statusEl.textContent = response.ok ? 'Connected to desktop app' : 'Connection failed';
+        if (response.ok) {
+          openProjectionStream();
+        }
       } catch (error) {
         statusEl.textContent = 'Connection failed';
       }
@@ -261,6 +387,9 @@ function createPairPageHtml(): string {
 
     ping();
     setInterval(ping, 3000);
+    window.addEventListener('beforeunload', function () {
+      if (source) source.close();
+    });
   </script>
 </body>
 </html>`
@@ -271,6 +400,58 @@ function writeJson(res: ServerResponse, statusCode: number, payload: unknown): v
   res.setHeader('Content-Type', 'application/json; charset=utf-8')
   res.setHeader('Access-Control-Allow-Origin', '*')
   res.end(JSON.stringify(payload))
+}
+
+function toProjectionStatusSnapshot(session: ProjectionSession): ProjectionStatusSnapshot {
+  return {
+    sessionId: session.sessionId,
+    targetDeviceId: session.targetDeviceId,
+    targetClientId: session.targetClientId,
+    active: session.active,
+    streamOnline: projectionStreams.has(session.targetClientId),
+    lastFrameId: session.lastFrameId,
+    lastSentAt: session.lastSentAt,
+    lastAckFrameId: session.lastAckFrameId,
+    lastAckAt: session.lastAckAt,
+    waitingAck: session.waitingAckFrameId > session.lastAckFrameId,
+    status: session.status,
+    lastMessage: session.lastMessage
+  }
+}
+
+function emitProjectionStatus(session: ProjectionSession): void {
+  if (!mainWindowRef || mainWindowRef.isDestroyed()) return
+  mainWindowRef.webContents.send('lan:projection-status', toProjectionStatusSnapshot(session))
+}
+
+function sendSseEvent(res: ServerResponse, event: string, payload: unknown): void {
+  res.write(`event: ${event}\n`)
+  res.write(`data: ${JSON.stringify(payload)}\n\n`)
+}
+
+function clearSessionAckTimer(session: ProjectionSession): void {
+  if (session.ackTimer) {
+    clearTimeout(session.ackTimer)
+    session.ackTimer = null
+  }
+}
+
+function stopProjectionSession(session: ProjectionSession, message: string): void {
+  clearSessionAckTimer(session)
+  session.active = false
+  session.status = 'stopped'
+  session.lastMessage = message
+  emitProjectionStatus(session)
+}
+
+function markProjectionStreamOffline(clientId: string): void {
+  for (const session of projectionSessions.values()) {
+    if (session.targetClientId !== clientId || !session.active) continue
+    session.status = 'offline'
+    session.lastMessage = '目标设备投映通道已断开'
+    clearSessionAckTimer(session)
+    emitProjectionStatus(session)
+  }
 }
 
 function mergeWebPeer(nextPeer: DeviceRecord): void {
@@ -323,6 +504,156 @@ function handlePairHello(req: IncomingMessage, res: ServerResponse): void {
   })
 }
 
+function startProjectionSession(targetDeviceId: string): ProjectionStartResult {
+  const isWebTarget = targetDeviceId.startsWith(WEB_PEER_PREFIX)
+  if (!isWebTarget) {
+    return {
+      ok: false,
+      sessionId: '',
+      targetDeviceId,
+      message: '当前仅支持 Web 配对设备投映，请先让手机打开 /pair 页面'
+    }
+  }
+
+  const targetClientId = targetDeviceId.slice(WEB_PEER_PREFIX.length)
+  const sessionId = randomUUID()
+  const session: ProjectionSession = {
+    sessionId,
+    targetDeviceId,
+    targetClientId,
+    active: true,
+    lastFrameId: 0,
+    lastSentAt: 0,
+    lastAckFrameId: 0,
+    lastAckAt: 0,
+    waitingAckFrameId: 0,
+    ackTimer: null,
+    status: projectionStreams.has(targetClientId) ? 'idle' : 'offline',
+    lastMessage: projectionStreams.has(targetClientId)
+      ? '投映会话已建立，等待发送帧'
+      : '目标设备未打开投映通道，请保持 /pair 页面前台'
+  }
+
+  projectionSessions.set(sessionId, session)
+  emitProjectionStatus(session)
+
+  return {
+    ok: true,
+    sessionId,
+    targetDeviceId,
+    message: session.lastMessage
+  }
+}
+
+function pushProjectionFrame(
+  sessionId: string,
+  payload: ProjectionPushPayload
+): ProjectionPushResult {
+  const session = projectionSessions.get(sessionId)
+  if (!session || !session.active) {
+    return {
+      ok: false,
+      sessionId,
+      frameId: 0,
+      message: '投映会话不存在或已关闭'
+    }
+  }
+
+  const stream = projectionStreams.get(session.targetClientId)
+  if (!stream) {
+    session.status = 'offline'
+    session.lastMessage = '目标设备离线，无法发送投映帧'
+    emitProjectionStatus(session)
+    return {
+      ok: false,
+      sessionId,
+      frameId: session.lastFrameId,
+      message: session.lastMessage
+    }
+  }
+
+  clearSessionAckTimer(session)
+  const nextFrameId = session.lastFrameId + 1
+  session.lastFrameId = nextFrameId
+  session.lastSentAt = Date.now()
+  session.waitingAckFrameId = nextFrameId
+  session.status = 'waiting-ack'
+  session.lastMessage = `已发送帧 #${nextFrameId}，等待目标设备 ACK`
+
+  sendSseEvent(stream, 'projection-frame', {
+    sessionId: session.sessionId,
+    frameId: nextFrameId,
+    imageDataUrl: payload.imageDataUrl,
+    overlap: payload.overlap,
+    sentAt: session.lastSentAt
+  })
+  emitProjectionStatus(session)
+
+  session.ackTimer = setTimeout(() => {
+    if (!session.active) return
+    if (session.lastAckFrameId >= nextFrameId) return
+    session.status = 'ack-timeout'
+    session.lastMessage = `帧 #${nextFrameId} ACK 超时`
+    emitProjectionStatus(session)
+  }, PROJECTION_ACK_TIMEOUT_MS)
+
+  return {
+    ok: true,
+    sessionId,
+    frameId: nextFrameId,
+    message: `frame #${nextFrameId} sent`
+  }
+}
+
+function handleProjectionAck(req: IncomingMessage, res: ServerResponse): void {
+  let raw = ''
+  req.setEncoding('utf-8')
+
+  req.on('data', (chunk) => {
+    raw += chunk
+    if (raw.length > 20_000) {
+      raw = ''
+      writeJson(res, 413, { ok: false })
+      req.destroy()
+    }
+  })
+
+  req.on('end', () => {
+    try {
+      const parsed = JSON.parse(raw) as ProjectionAckPayload
+      const clientId = (parsed.clientId || '').trim()
+      const sessionId = (parsed.sessionId || '').trim()
+      const frameId = Math.max(0, Number(parsed.frameId) || 0)
+
+      const session = projectionSessions.get(sessionId)
+      if (!session || !session.active) {
+        writeJson(res, 404, { ok: false, message: 'session not found' })
+        return
+      }
+
+      if (!clientId || clientId !== session.targetClientId) {
+        writeJson(res, 403, { ok: false, message: 'client mismatch' })
+        return
+      }
+
+      if (frameId > session.lastAckFrameId) {
+        session.lastAckFrameId = frameId
+        session.lastAckAt = Math.max(Date.now(), Number(parsed.renderedAt) || Date.now())
+        session.status = 'receiving'
+        session.lastMessage = `目标设备已渲染帧 #${frameId}`
+        if (frameId >= session.waitingAckFrameId) {
+          clearSessionAckTimer(session)
+        }
+        emitProjectionStatus(session)
+      }
+
+      writeJson(res, 200, { ok: true })
+    } catch {
+      writeJson(res, 400, { ok: false })
+    }
+  })
+}
+
 function startWebPairService(): void {
   const server = createServer((req, res) => {
     if (!req.url) {
@@ -352,6 +683,55 @@ function startWebPairService(): void {
       return
     }
 
+    if (req.method === 'GET' && req.url.startsWith('/api/projection/stream')) {
+      const requestUrl = new URL(req.url, `http://127.0.0.1:${WEB_PAIR_PORT}`)
+      const clientId = (requestUrl.searchParams.get('clientId') || '').replace(
+        /[^a-zA-Z0-9-_]/g,
+        ''
+      )
+      if (!clientId) {
+        writeJson(res, 400, { ok: false, message: 'clientId required' })
+        return
+      }
+
+      const previous = projectionStreams.get(clientId)
+      if (previous) {
+        previous.end()
+      }
+
+      res.writeHead(200, {
+        'Content-Type': 'text/event-stream; charset=utf-8',
+        'Cache-Control': 'no-cache, no-transform',
+        Connection: 'keep-alive',
+        'Access-Control-Allow-Origin': '*'
+      })
+      res.write(': connected\n\n')
+
+      projectionStreams.set(clientId, res)
+      for (const session of projectionSessions.values()) {
+        if (session.targetClientId !== clientId || !session.active) continue
+        if (session.status === 'offline') {
+          session.status = 'idle'
+          session.lastMessage = '目标设备投映通道已恢复'
+          emitProjectionStatus(session)
+        }
+      }
+
+      req.on('close', () => {
+        const current = projectionStreams.get(clientId)
+        if (current === res) {
+          projectionStreams.delete(clientId)
+          markProjectionStreamOffline(clientId)
+        }
+      })
+      return
+    }
+
+    if (req.method === 'POST' && req.url === '/api/projection/ack') {
+      handleProjectionAck(req, res)
+      return
+    }
+
     res.statusCode = 404
     res.end('Not Found')
   })
@@ -365,6 +745,16 @@ function startWebPairService(): void {
 }
 
 function stopWebPairService(): void {
+  for (const response of projectionStreams.values()) {
+    response.end()
+  }
+  projectionStreams.clear()
+
+  for (const session of projectionSessions.values()) {
+    stopProjectionSession(session, '应用停止投映会话')
+  }
+  projectionSessions.clear()
+
   if (webPairServer) {
     webPairServer.close()
     webPairServer = null
@@ -907,6 +1297,31 @@ app.whenReady().then(() => {
     const result = await connectAdbTarget(adb, target)
     await refreshAdbDevices()
     return result
+  })
+
+  ipcMain.handle('lan:projection-start', (_event, targetDeviceId: string) => {
+    return startProjectionSession(targetDeviceId)
+  })
+
+  ipcMain.handle(
+    'lan:projection-push',
+    (_event, sessionId: string, payload: ProjectionPushPayload) => {
+      return pushProjectionFrame(sessionId, payload)
+    }
+  )
+
+  ipcMain.handle('lan:projection-stop', (_event, sessionId: string) => {
+    const session = projectionSessions.get(sessionId)
+    if (!session) return false
+    stopProjectionSession(session, '桌面端手动停止投映')
+    projectionSessions.delete(sessionId)
+    return true
+  })
+
+  ipcMain.handle('lan:projection-status', (_event, sessionId: string) => {
+    const session = projectionSessions.get(sessionId)
+    if (!session) return null
+    return toProjectionStatusSnapshot(session)
   })
 
   startUdpDiscovery()

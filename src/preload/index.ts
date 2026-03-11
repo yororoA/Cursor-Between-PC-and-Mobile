@@ -10,11 +10,24 @@ const api = {
   getDiscoveryDebug: () => ipcRenderer.invoke('lan:get-discovery-debug'),
   getPairingInfo: () => ipcRenderer.invoke('lan:get-pairing-info'),
   adbConnect: (target: string) => ipcRenderer.invoke('lan:adb-connect', target),
+  projectionStart: (targetDeviceId: string) =>
+    ipcRenderer.invoke('lan:projection-start', targetDeviceId),
+  projectionPush: (sessionId: string, payload: unknown) =>
+    ipcRenderer.invoke('lan:projection-push', sessionId, payload),
+  projectionStop: (sessionId: string) => ipcRenderer.invoke('lan:projection-stop', sessionId),
+  projectionStatus: (sessionId: string) => ipcRenderer.invoke('lan:projection-status', sessionId),
   onDevicesUpdated: (callback: (devices: unknown[]) => void) => {
     const listener = (_event: unknown, devices: unknown[]): void => callback(devices)
     ipcRenderer.on('lan:devices-updated', listener)
     return () => {
       ipcRenderer.removeListener('lan:devices-updated', listener)
+    }
+  },
+  onProjectionStatus: (callback: (payload: unknown) => void) => {
+    const listener = (_event: unknown, payload: unknown): void => callback(payload)
+    ipcRenderer.on('lan:projection-status', listener)
+    return () => {
+      ipcRenderer.removeListener('lan:projection-status', listener)
     }
   }
 }
